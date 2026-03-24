@@ -65,8 +65,8 @@ PAIR_CONFIG = {
         "label": "JPY",
         "display": "USDJPY",
         "prefix": "usdjpy",
-        "artifact": "jpybest_model_artifact.joblib",
-        "metadata": "jpybest_model_metadata.json",
+        "artifact": "newjpybest_model_artifact.joblib",
+        "metadata": "newjpybest_model_metadata.json",
         "asset_class": "fx",
     },
 }
@@ -556,12 +556,14 @@ def _coerce_1d_array(x, length_hint=None):
 
 
 def _predict_fallback(est, X: pd.DataFrame, want_proba: bool):
-    """Predict robustly for artifacts saved from slightly different sklearn/xgboost environments.
-    Some old serialized pipelines break on DataFrame column handling and raise KeyError like 60.
-    In that case, retry with numpy values positionally.
+    """Robust prediction helper.
+
+    Some serialized artifacts are sensitive to DataFrame column metadata or sklearn version
+    differences. We try DataFrame first, then numpy, and finally a plain float64 array.
     """
     X_df = X
     X_np = X_df.to_numpy(dtype=float, copy=False)
+    X_np64 = np.asarray(X_np, dtype=np.float64)
 
     if want_proba:
         try:
@@ -570,7 +572,14 @@ def _predict_fallback(est, X: pd.DataFrame, want_proba: bool):
             try:
                 return est.predict_proba(X_np)
             except Exception as e2:
-                raise RuntimeError(f"predict_proba failed on DataFrame [{type(e1).__name__}: {e1}] and numpy [{type(e2).__name__}: {e2}]")
+                try:
+                    return est.predict_proba(X_np64)
+                except Exception as e3:
+                    raise RuntimeError(
+                        f"predict_proba failed on DataFrame [{type(e1).__name__}: {e1}] "
+                        f"and numpy [{type(e2).__name__}: {e2}] "
+                        f"and float64 numpy [{type(e3).__name__}: {e3}]"
+                    )
     else:
         try:
             return est.predict(X_df)
@@ -578,21 +587,64 @@ def _predict_fallback(est, X: pd.DataFrame, want_proba: bool):
             try:
                 return est.predict(X_np)
             except Exception as e2:
-                raise RuntimeError(f"predict failed on DataFrame [{type(e1).__name__}: {e1}] and numpy [{type(e2).__name__}: {e2}]")
+                try:
+                    return est.predict(X_np64)
+                except Exception as e3:
+                    raise RuntimeError(
+                        f"predict failed on DataFrame [{type(e1).__name__}: {e1}] "
+                        f"and numpy [{type(e2).__name__}: {e2}] "
+                        f"and float64 numpy [{type(e3).__name__}: {e3}]"
+                    )
+
+
+def _predict_sklearn_pipeline_manually(pipeline_obj, X: pd.DataFrame):
+    """Manual pipeline execution fallback for older artifacts."""
+    Xt_df = X.copy()
+    Xt_np = Xt_df.to_numpy(dtype=float, copy=False)
+
+    imputer = getattr(pipeline_obj, "named_steps", {}).get("imputer")
+    final_model = getattr(pipeline_obj, "named_steps", {}).get("model")
+
+    Xt = Xt_np
+    if imputer is not None:
+        try:
+            Xt = imputer.transform(Xt_df)
+        except Exception:
+            Xt = imputer.transform(Xt_np)
+
+    if final_model is None:
+        raise ValueError("Pipeline manual fallback could not find final 'model' step.")
+
+    pred_num = _coerce_1d_array(final_model.predict(Xt), len(X)).astype(float)
+    if hasattr(final_model, "predict_proba"):
+        pred_prob = np.asarray(final_model.predict_proba(Xt))
+        if pred_prob.ndim == 2 and pred_prob.shape[1] >= 2:
+            pred_prob = pred_prob[:, 1]
+        else:
+            pred_prob = pred_prob.reshape(-1)
+    else:
+        pred_prob = np.where(pred_num == 1, 1.0, 0.0)
+
+    return pred_num, _coerce_1d_array(pred_prob, len(X)).astype(float)
 
 
 def predict_with_loaded_artifact(model, X: pd.DataFrame):
     if hasattr(model, "predict"):
-        pred_num = _coerce_1d_array(_predict_fallback(model, X, want_proba=False), len(X))
-        if hasattr(model, "predict_proba"):
-            pred_prob = np.asarray(_predict_fallback(model, X, want_proba=True))
-            if pred_prob.ndim == 2 and pred_prob.shape[1] >= 2:
-                pred_prob = pred_prob[:, 1]
+        try:
+            pred_num = _coerce_1d_array(_predict_fallback(model, X, want_proba=False), len(X))
+            if hasattr(model, "predict_proba"):
+                pred_prob = np.asarray(_predict_fallback(model, X, want_proba=True))
+                if pred_prob.ndim == 2 and pred_prob.shape[1] >= 2:
+                    pred_prob = pred_prob[:, 1]
+                else:
+                    pred_prob = pred_prob.reshape(-1)
             else:
-                pred_prob = pred_prob.reshape(-1)
-        else:
-            pred_prob = np.where(pred_num == 1, 1.0, 0.0)
-        return pred_num.astype(float), _coerce_1d_array(pred_prob, len(X)).astype(float)
+                pred_prob = np.where(pred_num == 1, 1.0, 0.0)
+            return pred_num.astype(float), _coerce_1d_array(pred_prob, len(X)).astype(float)
+        except Exception:
+            if hasattr(model, "named_steps") and "model" in model.named_steps:
+                return _predict_sklearn_pipeline_manually(model, X)
+            raise
 
     if isinstance(model, dict):
         model_type = str(model.get("type", "")).lower()
@@ -903,60 +955,61 @@ def build_home_summary(pair_results: dict, viewer_tz_name: str) -> pd.DataFrame:
     rows = []
     for instrument in PAIR_ORDER:
         result = pair_results.get(instrument)
-        final_df = None if result is None else result.get("final_table")
-        if final_df is None or final_df.empty:
+        final_table = result.get("final_table") if isinstance(result, dict) else None
+        if final_table is None or final_table.empty:
             continue
 
-        df = final_df.copy()
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-        df = df.dropna(subset=["time"]).copy()
+        df = final_table.copy()
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        df = df[df["time"].dt.tz_convert(NY_TZ).dt.date == pd.Timestamp.now(tz=NY_TZ).date()].copy()
         if df.empty:
             continue
 
-        df["ny_date"] = df["time"].dt.tz_convert(NY_TZ).dt.date
-        current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
-        df = df[df["ny_date"] == current_ny_day].copy()
+        df = df[df["final_prediction"].isin(["Bullish", "Bearish"])].copy()
         if df.empty:
             continue
 
-        for _, row in df.iterrows():
-            rows.append({
-                "sort_time": row["time"],
-                "Viewer Time": row["time"].tz_convert(viewer_tz).strftime("%Y-%m-%d %H:%M %Z"),
-                "Currency Pair": PAIR_CONFIG[instrument]["display"],
-                "Prediction": row.get("final_prediction", "Unsure"),
-                "Actual": row.get("actual_final", "Pending"),
-                "Status": row.get("final_status", "Pending"),
-                "Confidence": row.get("final_confidence", np.nan),
-            })
+        df["Viewer Time"] = df["time"].dt.tz_convert(viewer_tz).dt.strftime("%Y-%m-%d %H:%M %Z")
+        df["Currency Pair"] = PAIR_CONFIG[instrument]["display"]
+        df["Prediction"] = df["final_prediction"]
+        df["Actual"] = df["actual_final"].fillna("Pending")
+        df["Status"] = df["final_status"].fillna("Pending")
+        df["Confidence"] = df["final_confidence"]
+        rows.append(df[["time", "Viewer Time", "Currency Pair", "Prediction", "Actual", "Status", "Confidence"]])
 
     if not rows:
         return pd.DataFrame(columns=["Viewer Time", "Currency Pair", "Prediction", "Actual", "Status", "Confidence"])
 
-    out = pd.DataFrame(rows).sort_values("sort_time", ascending=False).reset_index(drop=True)
+    out = pd.concat(rows, ignore_index=True)
+    out = out.sort_values("time", ascending=False).reset_index(drop=True)
     return out[["Viewer Time", "Currency Pair", "Prediction", "Actual", "Status", "Confidence"]]
 
 
 def get_home_summary_stats(pair_results: dict) -> dict:
     wins = 0
     losses = 0
+
     for instrument in PAIR_ORDER:
         result = pair_results.get(instrument)
-        final_df = None if result is None else result.get("final_table")
-        if final_df is None or final_df.empty:
+        final_table = result.get("final_table") if isinstance(result, dict) else None
+        if final_table is None or final_table.empty:
             continue
-        df = final_df.copy()
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-        df = df.dropna(subset=["time"]).copy()
+
+        df = final_table.copy()
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        df = df[df["time"].dt.tz_convert(NY_TZ).dt.date == pd.Timestamp.now(tz=NY_TZ).date()].copy()
         if df.empty:
             continue
-        current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
-        df = df[df["time"].dt.tz_convert(NY_TZ).dt.date == current_ny_day].copy()
+
+        df = df[df["final_prediction"].isin(["Bullish", "Bearish"])].copy()
+        if df.empty:
+            continue
+
         wins += int((df["final_status"] == "👑 Win").sum())
         losses += int((df["final_status"] == "❌ Loss").sum())
 
-    total = wins + losses
-    win_rate = wins / total if total > 0 else np.nan
+    trades = wins + losses
+    win_rate = wins / trades if trades > 0 else np.nan
     return {"wins": wins, "losses": losses, "win_rate": win_rate}
 
 
