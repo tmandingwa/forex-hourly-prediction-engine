@@ -1,4 +1,3 @@
-import os
 import json
 import time
 import joblib
@@ -6,12 +5,11 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
-
+import traceback
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 import streamlit.components.v1 as components
 
 try:
@@ -19,32 +17,76 @@ try:
 except Exception:
     st_javascript = None
 
-# ============================================================
-# FX NEXT-HOUR PREDICTION APP
-# ============================================================
-
-st.set_page_config(page_title="FX Next Hour Prediction App", layout="wide")
+st.set_page_config(page_title="FX Multi-Pair Trading Dashboard", layout="wide")
 
 NY_TZ = ZoneInfo("America/New_York")
 UTC_TZ = ZoneInfo("UTC")
 
-PAIRS = ["EUR_USD", "GBP_USD", "AUD_USD"]
-PAIR_LABELS = {"EUR_USD": "EUR", "GBP_USD": "GBP", "AUD_USD": "AUD"}
+PAIR_CONFIG = {
+    "EUR_USD": {
+        "label": "EUR",
+        "display": "EURUSD",
+        "prefix": "eur",
+        "artifact": "best_model_artifact.joblib",
+        "metadata": "best_model_metadata.json",
+        "asset_class": "fx",
+    },
+    "GBP_USD": {
+        "label": "GBP",
+        "display": "GBPUSD",
+        "prefix": "gbp",
+        "artifact": "gbpbest_model_artifact.joblib",
+        "metadata": "gbpbest_model_metadata.json",
+        "asset_class": "fx",
+    },
+    "XAU_USD": {
+        "label": "XAU",
+        "display": "XAUUSD",
+        "prefix": "xau",
+        "artifact": "xaubest_model_artifact.joblib",
+        "metadata": "xaubest_model_metadata.json",
+        "asset_class": "metal",
+    },
+    "AUD_USD": {
+        "label": "AUD",
+        "display": "AUDUSD",
+        "prefix": "aud",
+        "artifact": "audbest_model_artifact.joblib",
+        "metadata": "audbest_model_metadata.json",
+        "asset_class": "fx",
+    },
+    "USD_JPY": {
+        "label": "JPY",
+        "display": "USDJPY",
+        "prefix": "usdjpy",
+        "artifact": "jpybest_model_artifact.joblib",
+        "metadata": "jpybest_model_metadata.json",
+        "asset_class": "fx",
+    },
+}
+
+PAIR_ORDER = ["EUR_USD", "GBP_USD", "XAU_USD", "AUD_USD", "USD_JPY"]
 GRANULARITY = "H1"
 PRICE = "BA"
 MAX_CANDLES_PER_REQUEST = 1000
 MIN_COUNT_REQUIRED = 5
 DEFAULT_DAYS_BACK = 270
+DEFAULT_NUM_LAGS = 6
+MAX_NUM_LAGS = 15
+MAX_HISTORY_DAYS = 2500
 APP_DIR = Path(__file__).resolve().parent
-ML_ARTIFACT_PATH = APP_DIR / "best_model_artifact.joblib"
-ML_METADATA_PATH = APP_DIR / "best_model_metadata.json"
+MODEL_DIR = APP_DIR / "models"
+
+GOOGLE_DRIVE_FILE_IDS = {
+    "AUD_USD": "1D19KhexIsQ_bNyvPr0hAzTPmuG1Ld5vl",
+    "USD_JPY": "1pzJctNp9W64OVXq7116DmrEkPslwt2M-",
+    "XAU_USD": "178xJSdurCZQh3WR4S-VIJHJenvY9JOPJ",
+}
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
-DEFAULT_NUM_LAGS = 4
-
 def get_now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -63,68 +105,11 @@ def safe_request(url, headers, params, retries=3, sleep_seconds=2):
             response = requests.get(url, headers=headers, params=params, timeout=30)
             response.raise_for_status()
             return response
-        except Exception as e:
-            last_err = e
+        except Exception as exc:
+            last_err = exc
             if i < retries - 1:
                 time.sleep(sleep_seconds)
     raise last_err
-
-
-def candle_direction(open_, close_):
-    if pd.isna(open_) or pd.isna(close_):
-        return None
-    if close_ > open_:
-        return "Bullish"
-    elif close_ < open_:
-        return "Bearish"
-    return "Doji"
-
-def candle_direction_code(open_, close_):
-    if pd.isna(open_) or pd.isna(close_):
-        return None
-    if close_ > open_:
-        return "U"
-    elif close_ < open_:
-        return "D"
-    return "N"
-
-
-def build_key_from_lag_values(lag_values):
-    """
-    lag_values must be ordered oldest -> newest
-    Example for 4 lags: [lag4, lag3, lag2, lag1]
-    KEY becomes:
-    lag4lag3lag2lag1 + lag3lag2lag1 + lag2lag1 + lag1
-    """
-    if not lag_values:
-        return ""
-    if any(v is None or pd.isna(v) or str(v) == "" for v in lag_values):
-        return ""
-
-    parts = []
-    n = len(lag_values)
-    for start in range(n):
-        parts.append("".join(str(x) for x in lag_values[start:]))
-
-    return "".join(parts)
-
-
-def inject_auto_refresh():
-    js = """
-    <script>
-    (function() {
-      const now = new Date();
-      const sec = now.getSeconds();
-      const ms = now.getMilliseconds();
-      const secsUntilNextMinute = 60 - sec;
-      const delay = (secsUntilNextMinute * 1000) - ms;
-      setTimeout(function() {
-        window.location.reload();
-      }, Math.max(delay, 1000));
-    })();
-    </script>
-    """
-    components.html(js, height=0)
 
 
 def detect_viewer_timezone() -> str:
@@ -140,55 +125,191 @@ def detect_viewer_timezone() -> str:
     return fallback_tz
 
 
-def next_session_status_block(now_ny: datetime, viewer_tz_name: str) -> pd.DataFrame:
+def inject_auto_refresh():
+    js = """
+    <script>
+    (function() {
+      const now = new Date();
+      const sec = now.getSeconds();
+      const ms = now.getMilliseconds();
+      const secsUntilNextMinute = 60 - sec;
+      const delay = (secsUntilNextMinute * 1000) - ms;
+      setTimeout(function() { window.location.reload(); }, Math.max(delay, 1000));
+    })();
+    </script>
+    """
+    components.html(js, height=0)
+
+
+def candle_direction(open_, close_):
+    if pd.isna(open_) or pd.isna(close_):
+        return None
+    if close_ > open_:
+        return "Bullish"
+    if close_ < open_:
+        return "Bearish"
+    return "Doji"
+
+
+def candle_direction_code(open_, close_):
+    if pd.isna(open_) or pd.isna(close_):
+        return None
+    if close_ > open_:
+        return "U"
+    if close_ < open_:
+        return "D"
+    return "N"
+
+
+def prediction_to_numeric(pred):
+    if pred == "Bullish":
+        return 1
+    if pred == "Bearish":
+        return 0
+    return np.nan
+
+
+def build_key_from_lag_values(lag_values):
+    if not lag_values:
+        return ""
+    if any(v is None or pd.isna(v) or str(v) == "" for v in lag_values):
+        return ""
+    parts = []
+    n = len(lag_values)
+    for start in range(n):
+        parts.append("".join(str(x) for x in lag_values[start:]))
+    return "".join(parts)
+
+
+def pct_display(x):
+    if pd.isna(x):
+        return "-"
+    return f"{float(x) * 100:.2f}%"
+
+
+def status_badge(val):
+    val = "" if pd.isna(val) else str(val)
+    if val == "Bullish":
+        return "▲ Bullish"
+    if val == "Bearish":
+        return "▼ Bearish"
+    if val == "Doji":
+        return "● Doji"
+    if val == "Unsure":
+        return "? Unsure"
+    if val == "Pending":
+        return "… Pending"
+    if val == "👑 Win":
+        return "👑 Win"
+    if val == "❌ Loss":
+        return "❌ Loss"
+    if val == "🚫 No Trade":
+        return "🚫 No Trade"
+    return val
+
+
+def viewer_time_strings(viewer_tz_name: str):
+    viewer_tz = ZoneInfo(viewer_tz_name)
+    now_utc = get_now_utc()
+    now_viewer = now_utc.astimezone(viewer_tz)
+    now_atl = now_utc.astimezone(NY_TZ)
+    return {
+        "viewer": now_viewer,
+        "utc": now_utc,
+        "atl": now_atl,
+        "viewer_str": now_viewer.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "utc_str": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "atl_str": now_atl.strftime("%Y-%m-%d %H:%M:%S %Z"),
+    }
+
+
+def market_session_status(now_ny: datetime, viewer_tz_name: str) -> pd.DataFrame:
     viewer_tz = ZoneInfo(viewer_tz_name)
     sessions = [
         {"session": "Tokyo", "open_hour": 19, "close_hour": 4},
         {"session": "London", "open_hour": 3, "close_hour": 12},
         {"session": "New York", "open_hour": 8, "close_hour": 17},
     ]
-
     rows = []
-
     for s in sessions:
         open_ny = now_ny.replace(hour=s["open_hour"], minute=0, second=0, microsecond=0)
         close_ny = now_ny.replace(hour=s["close_hour"], minute=0, second=0, microsecond=0)
-
         if s["open_hour"] > s["close_hour"]:
             if now_ny.hour < s["close_hour"]:
                 open_ny -= timedelta(days=1)
             else:
                 close_ny += timedelta(days=1)
-
         open_viewer = open_ny.astimezone(viewer_tz)
         close_viewer = close_ny.astimezone(viewer_tz)
-
         if s["open_hour"] < s["close_hour"]:
             is_open = s["open_hour"] <= now_ny.hour < s["close_hour"]
         else:
             is_open = now_ny.hour >= s["open_hour"] or now_ny.hour < s["close_hour"]
-
         rows.append(
             {
                 "Session": s["session"],
                 "Status": "OPEN" if is_open else "CLOSED",
-                f"Time ({viewer_tz_name})": f"{open_viewer.strftime('%H:%M')} → {close_viewer.strftime('%H:%M')}",
+                f"Viewer Time ({viewer_tz_name})": f"{open_viewer.strftime('%H:%M')} → {close_viewer.strftime('%H:%M')}",
             }
         )
-
     return pd.DataFrame(rows)
 
 
-# ============================================================
-# DATA FETCH
-# ============================================================
-@st.cache_data(ttl=10, show_spinner=False)
-def fetch_oanda_candles(api_key: str, instrument: str, days_back: int) -> pd.DataFrame:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+def download_large_file_from_google_drive(file_id: str, destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        return destination
 
+    url = "https://drive.google.com/uc?export=download"
+    session = requests.Session()
+    response = session.get(url, params={"id": file_id}, stream=True, timeout=120)
+
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            token = value
+            break
+
+    if token:
+        response.close()
+        response = session.get(
+            url,
+            params={"id": file_id, "confirm": token},
+            stream=True,
+            timeout=120,
+        )
+
+    response.raise_for_status()
+    with open(destination, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+    response.close()
+    return destination
+
+
+def resolve_artifact_path(instrument: str, artifact_name: str) -> Path:
+    local_path = APP_DIR / artifact_name
+    if local_path.exists():
+        return local_path
+
+    downloaded_path = MODEL_DIR / artifact_name
+    if downloaded_path.exists():
+        return downloaded_path
+
+    file_id = GOOGLE_DRIVE_FILE_IDS.get(instrument)
+    if not file_id:
+        raise FileNotFoundError(f"Missing artifact file: {artifact_name}")
+
+    return download_large_file_from_google_drive(file_id, downloaded_path)
+
+
+# ============================================================
+# OANDA DATA
+# ============================================================
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_oanda_candles(api_key: str, instrument: str, days_back: int) -> pd.DataFrame:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     base_url = f"https://api-fxpractice.oanda.com/v3/instruments/{instrument}/candles"
 
     end_time = get_now_utc()
@@ -197,7 +318,6 @@ def fetch_oanda_candles(api_key: str, instrument: str, days_back: int) -> pd.Dat
 
     all_rows = []
     current_start = start_time
-
     while current_start < end_time:
         current_end = min(current_start + chunk_size, end_time)
         params = {
@@ -206,20 +326,12 @@ def fetch_oanda_candles(api_key: str, instrument: str, days_back: int) -> pd.Dat
             "granularity": GRANULARITY,
             "price": PRICE,
         }
-
-        response = safe_request(base_url, headers, params, retries=3, sleep_seconds=2)
-        data = response.json()
-
-        candles = data.get("candles", [])
+        response = safe_request(base_url, headers, params)
+        candles = response.json().get("candles", [])
         for candle in candles:
             if not candle.get("complete", False):
                 continue
-
-            row = {
-                "time": candle["time"],
-                "volume": candle.get("volume"),
-            }
-
+            row = {"time": candle["time"], "volume": candle.get("volume")}
             if "bid" in candle:
                 row["bid_o"] = safe_float(candle["bid"]["o"])
                 row["bid_h"] = safe_float(candle["bid"]["h"])
@@ -227,7 +339,6 @@ def fetch_oanda_candles(api_key: str, instrument: str, days_back: int) -> pd.Dat
                 row["bid_c"] = safe_float(candle["bid"]["c"])
             else:
                 row["bid_o"] = row["bid_h"] = row["bid_l"] = row["bid_c"] = np.nan
-
             if "ask" in candle:
                 row["ask_o"] = safe_float(candle["ask"]["o"])
                 row["ask_h"] = safe_float(candle["ask"]["h"])
@@ -235,17 +346,11 @@ def fetch_oanda_candles(api_key: str, instrument: str, days_back: int) -> pd.Dat
                 row["ask_c"] = safe_float(candle["ask"]["c"])
             else:
                 row["ask_o"] = row["ask_h"] = row["ask_l"] = row["ask_c"] = np.nan
-
-            if pd.notna(row["bid_o"]) and pd.notna(row["ask_o"]):
-                row["mid_o"] = (row["bid_o"] + row["ask_o"]) / 2
-                row["mid_h"] = (row["bid_h"] + row["ask_h"]) / 2
-                row["mid_l"] = (row["bid_l"] + row["ask_l"]) / 2
-                row["mid_c"] = (row["bid_c"] + row["ask_c"]) / 2
-            else:
-                row["mid_o"] = row["mid_h"] = row["mid_l"] = row["mid_c"] = np.nan
-
+            row["mid_o"] = (row["bid_o"] + row["ask_o"]) / 2 if pd.notna(row["bid_o"]) and pd.notna(row["ask_o"]) else np.nan
+            row["mid_h"] = (row["bid_h"] + row["ask_h"]) / 2 if pd.notna(row["bid_h"]) and pd.notna(row["ask_h"]) else np.nan
+            row["mid_l"] = (row["bid_l"] + row["ask_l"]) / 2 if pd.notna(row["bid_l"]) and pd.notna(row["ask_l"]) else np.nan
+            row["mid_c"] = (row["bid_c"] + row["ask_c"]) / 2 if pd.notna(row["bid_c"]) and pd.notna(row["ask_c"]) else np.nan
             all_rows.append(row)
-
         current_start = current_end
 
     df = pd.DataFrame(all_rows)
@@ -254,59 +359,43 @@ def fetch_oanda_candles(api_key: str, instrument: str, days_back: int) -> pd.Dat
 
     df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
     df = df.dropna(subset=["time"]).drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
-
-    df_mid = df[["time", "mid_o", "mid_h", "mid_l", "mid_c", "volume"]].copy()
-    df_mid.rename(
-        columns={
-            "mid_o": "open",
-            "mid_h": "high",
-            "mid_l": "low",
-            "mid_c": "close",
-        },
-        inplace=True,
-    )
-    df_mid["complete"] = True
-    df_mid = df_mid[["time", "complete", "open", "high", "low", "close", "volume"]]
-    return df_mid
+    out = df[["time", "mid_o", "mid_h", "mid_l", "mid_c", "volume"]].copy()
+    out.rename(columns={"mid_o": "open", "mid_h": "high", "mid_l": "low", "mid_c": "close"}, inplace=True)
+    out["complete"] = True
+    return out[["time", "complete", "open", "high", "low", "close", "volume"]]
 
 
 # ============================================================
-# PATTERN PROBABILITY PIPELINE
+# PATTERN / PROBABILITY PIPELINE
 # ============================================================
 def prepare_df_tz(df_mid: pd.DataFrame) -> pd.DataFrame:
-    df_tz = df_mid.copy()
-    df_tz["time"] = pd.to_datetime(df_tz["time"], utc=True, errors="coerce")
-    df_tz = df_tz.dropna(subset=["time"]).copy()
-
-    df_tz["time_ny"] = df_tz["time"].dt.tz_convert(NY_TZ)
-    df_tz["ny_utc_offset_hours"] = df_tz["time_ny"].apply(
-        lambda x: x.utcoffset().total_seconds() / 3600 if pd.notna(x) else np.nan
-    )
-    df_tz["ny_season_clock"] = df_tz["ny_utc_offset_hours"].map({-4.0: "EDT", -5.0: "EST"})
-    df_tz["ny_hour"] = df_tz["time_ny"].dt.hour
-    df_tz["is_ny_8am_candle"] = (
-        (df_tz["time_ny"].dt.hour == 8) &
-        (df_tz["time_ny"].dt.minute == 0)
-    )
-
-    return df_tz.sort_values("time").reset_index(drop=True)
+    df = df_mid.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    df["time_ny"] = df["time"].dt.tz_convert(NY_TZ)
+    df["ny_hour"] = df["time_ny"].dt.hour
+    df["day_of_week_num"] = df["time_ny"].dt.dayofweek
+    return df
 
 
-def build_pattern_dataset(df_tz: pd.DataFrame, num_lags: int = DEFAULT_NUM_LAGS) -> pd.DataFrame:
+def build_pattern_dataset(df_tz: pd.DataFrame, num_lags: int = DEFAULT_NUM_LAGS, include_day_of_week: bool = False) -> pd.DataFrame:
     df = df_tz.copy().sort_values("time").reset_index(drop=True)
     df["dir"] = df.apply(lambda row: candle_direction_code(row["open"], row["close"]), axis=1)
 
     for i in range(1, num_lags + 1):
         df[f"lag{i}"] = df["dir"].shift(i)
 
-    def row_key(r):
-        lag_values = [r.get(f"lag{i}") for i in range(num_lags, 0, -1)]  # lagN ... lag1
-        return build_key_from_lag_values(lag_values)
+    def row_key(row):
+        lag_values = [row.get(f"lag{i}") for i in range(num_lags, 0, -1)]
+        key = build_key_from_lag_values(lag_values)
+        if include_day_of_week and key != "" and pd.notna(row.get("day_of_week_num")):
+            key = f"D{int(row['day_of_week_num'])}_{key}"
+        return key
 
     df["KEY"] = df.apply(row_key, axis=1)
 
     if len(df) < num_lags:
-        raise ValueError(f"Need at least {num_lags} completed candles to generate a future row.")
+        raise ValueError(f"Need at least {num_lags} completed candles to generate the next row.")
 
     last_row = df.iloc[-1]
     future_time = pd.to_datetime(last_row["time"], utc=True) + pd.Timedelta(hours=1)
@@ -315,19 +404,17 @@ def build_pattern_dataset(df_tz: pd.DataFrame, num_lags: int = DEFAULT_NUM_LAGS)
     new_row = {col: np.nan for col in df.columns}
     new_row["time"] = future_time
     new_row["time_ny"] = future_time_ny
-    new_row["ny_utc_offset_hours"] = future_time_ny.utcoffset().total_seconds() / 3600
-    new_row["ny_season_clock"] = "EDT" if new_row["ny_utc_offset_hours"] == -4 else "EST"
     new_row["ny_hour"] = future_time_ny.hour
-    new_row["is_ny_8am_candle"] = (future_time_ny.hour == 8 and future_time_ny.minute == 0)
-
+    new_row["day_of_week_num"] = future_time_ny.dayofweek
     for i in range(1, num_lags + 1):
         new_row[f"lag{i}"] = df.iloc[-i]["dir"]
+    future_lag_values = [new_row[f"lag{i}"] for i in range(num_lags, 0, -1)]
+    future_key = build_key_from_lag_values(future_lag_values)
+    if include_day_of_week and future_key != "":
+        future_key = f"D{int(new_row['day_of_week_num'])}_{future_key}"
+    new_row["KEY"] = future_key
 
-    future_lag_values = [new_row[f"lag{i}"] for i in range(num_lags, 0, -1)]  # lagN ... lag1
-    new_row["KEY"] = build_key_from_lag_values(future_lag_values)
-
-    new_row_df = pd.DataFrame([new_row])
-    df = pd.concat([df, new_row_df], ignore_index=True)
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
     return df
 
 
@@ -336,43 +423,27 @@ def summarise_keys(df: pd.DataFrame, min_count_required: int = MIN_COUNT_REQUIRE
     hist_df = hist_df.dropna(subset=["KEY", "dir"])
     hist_df = hist_df[hist_df["KEY"] != ""]
 
-    key_summary = (
-        hist_df.groupby(["KEY", "dir"])
-        .size()
-        .unstack(fill_value=0)
-    )
-
+    key_summary = hist_df.groupby(["KEY", "dir"]).size().unstack(fill_value=0)
     for col in ["U", "D", "N"]:
         if col not in key_summary.columns:
             key_summary[col] = 0
-
     key_summary = key_summary[["U", "D", "N"]].copy()
-    key_summary["max_count"] = key_summary[["U", "D", "N"]].max(axis=1)
     key_summary["total_count"] = key_summary[["U", "D", "N"]].sum(axis=1)
-    key_summary["confidence"] = np.where(
-        key_summary["total_count"] > 0,
-        key_summary["max_count"] / key_summary["total_count"],
-        np.nan,
-    )
+    key_summary["max_count"] = key_summary[["U", "D", "N"]].max(axis=1)
+    key_summary["confidence"] = np.where(key_summary["total_count"] > 0, key_summary["max_count"] / key_summary["total_count"], np.nan)
 
     def decide_prediction(row):
         counts = {"U": row["U"], "D": row["D"], "N": row["N"]}
-        max_count = max(counts.values())
-
         if row["total_count"] < min_count_required:
             return "Unsure"
-
+        max_count = max(counts.values())
         winners = [k for k, v in counts.items() if v == max_count]
         if len(winners) != 1:
             return "Unsure"
-
         return winners[0]
 
     key_summary["prediction"] = key_summary.apply(decide_prediction, axis=1)
-    key_summary["prediction_label"] = key_summary["prediction"].map(
-        {"U": "Bullish", "D": "Bearish", "N": "Doji", "Unsure": "Unsure"}
-    )
-
+    key_summary["prediction_label"] = key_summary["prediction"].map({"U": "Bullish", "D": "Bearish", "N": "Doji", "Unsure": "Unsure"})
     return key_summary.reset_index()
 
 
@@ -380,116 +451,81 @@ def predict_next_hour(df_with_future: pd.DataFrame, key_summary: pd.DataFrame) -
     future_row = df_with_future.iloc[-1]
     future_key = future_row["KEY"]
     future_time = pd.to_datetime(future_row["time"], utc=True)
-    future_time_ny = future_time.tz_convert(NY_TZ)
-
     match = key_summary[key_summary["KEY"] == future_key]
-
     if match.empty:
         return {
             "future_key": future_key,
             "prediction": "Unsure",
             "prediction_label": "Unsure",
             "confidence": np.nan,
-            "U": 0,
-            "D": 0,
-            "N": 0,
             "total_count": 0,
             "future_time_utc": future_time,
-            "future_time_ny": future_time_ny,
         }
-
     row = match.iloc[0]
     return {
         "future_key": future_key,
         "prediction": row["prediction"],
         "prediction_label": row["prediction_label"],
         "confidence": float(row["confidence"]) if pd.notna(row["confidence"]) else np.nan,
-        "U": int(row["U"]),
-        "D": int(row["D"]),
-        "N": int(row["N"]),
         "total_count": int(row["total_count"]),
         "future_time_utc": future_time,
-        "future_time_ny": future_time_ny,
     }
 
 
-def build_intraday_prediction_table(
-    df_with_future: pd.DataFrame,
-    key_summary: pd.DataFrame,
-    next_pred: dict,
-    num_lags: int
-) -> pd.DataFrame:
-    df_hist = df_with_future.iloc[:-1].copy()
+def build_probability_log(df_with_future: pd.DataFrame, key_summary: pd.DataFrame, next_pred: dict, viewer_tz_name: str, num_lags: int) -> pd.DataFrame:
+    viewer_tz = ZoneInfo(viewer_tz_name)
+    hist = df_with_future.iloc[:-1].copy()
+    pred_map = key_summary[["KEY", "prediction_label", "confidence", "total_count"]].copy()
+    hist = hist.merge(pred_map, on="KEY", how="left")
+    hist["probability_prediction"] = hist["prediction_label"].fillna("Unsure")
+    hist["actual"] = hist["dir"].map({"U": "Bullish", "D": "Bearish", "N": "Doji"})
 
-    pred_map = key_summary[["KEY", "prediction", "prediction_label", "confidence", "total_count"]].copy()
-    df_hist = df_hist.merge(pred_map, on="KEY", how="left")
-
-    df_hist["actual"] = df_hist["dir"].map({"U": "Bullish", "D": "Bearish", "N": "Doji"})
-    df_hist["prediction_for_this_row"] = df_hist["prediction_label"].fillna("Unsure")
-
-    def match_status(row):
-        pred = row["prediction_for_this_row"]
+    def status_from_row(row):
+        pred = row["probability_prediction"]
         actual = row["actual"]
         if pd.isna(actual):
             return "Pending"
         if pred == "Unsure":
-            return "Unsure"
-        return "Matched" if pred == actual else "Mismatched"
+            return "🚫 No Trade"
+        return "👑 Win" if pred == actual else "❌ Loss"
 
-    df_hist["match_status"] = df_hist.apply(match_status, axis=1)
+    hist["status"] = hist.apply(status_from_row, axis=1)
 
-    current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
-    df_hist = df_hist[df_hist["time_ny"].dt.date == current_ny_day].copy()
-
-    lag_cols = [f"lag{i}" for i in range(num_lags, 0, -1)]
-
-    hist_cols = [
-        "time", "time_ny", "open", "high", "low", "close",
-        *lag_cols, "KEY",
-        "prediction_for_this_row", "actual", "match_status",
-        "confidence", "total_count"
-    ]
-    df_hist = df_hist[hist_cols].copy()
-
-    future_payload = {
-        "time": next_pred["future_time_utc"],
-        "time_ny": next_pred["future_time_ny"],
-        "open": np.nan,
-        "high": np.nan,
-        "low": np.nan,
-        "close": np.nan,
-        "KEY": next_pred["future_key"],
-        "prediction_for_this_row": next_pred["prediction_label"],
-        "actual": "Pending",
-        "match_status": "Pending",
-        "confidence": next_pred["confidence"],
-        "total_count": next_pred["total_count"],
-    }
-
-    for i in range(num_lags, 0, -1):
-        future_payload[f"lag{i}"] = df_with_future.iloc[-1].get(f"lag{i}", np.nan)
-
-    future = pd.DataFrame([future_payload])
-
-    out = pd.concat([df_hist, future], ignore_index=True)
+    future_row = pd.DataFrame([
+        {
+            "time": next_pred["future_time_utc"],
+            "probability_prediction": next_pred["prediction_label"],
+            "actual": "Pending",
+            "status": "Pending",
+            "confidence": next_pred["confidence"],
+            "total_count": next_pred["total_count"],
+        }
+    ])
+    out = pd.concat([
+        hist[["time", "probability_prediction", "actual", "status", "confidence", "total_count"]],
+        future_row,
+    ], ignore_index=True)
     out["time"] = pd.to_datetime(out["time"], utc=True)
-    out["time_ny"] = pd.to_datetime(out["time_ny"], utc=True).dt.tz_convert(NY_TZ)
-    out = out.sort_values("time").reset_index(drop=True)
-    return out
+    out["viewer_time"] = out["time"].dt.tz_convert(viewer_tz)
+    out["viewer_time_display"] = out["viewer_time"].dt.strftime("%Y-%m-%d %H:%M %Z")
+    current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
+    out = out[out["time"].dt.tz_convert(NY_TZ).dt.date == current_ny_day].copy()
+    out.rename(columns={"confidence": "probability_confidence", "status": "probability_status"}, inplace=True)
+    return out[["time", "viewer_time_display", "probability_prediction", "actual", "probability_confidence", "probability_status", "total_count"]].sort_values("time").reset_index(drop=True)
 
 
 # ============================================================
-# EURUSD ML PIPELINE
+# ML PIPELINE
 # ============================================================
 @st.cache_resource(show_spinner=False)
-def load_eur_ml_artifacts():
-    if not ML_ARTIFACT_PATH.exists():
-        raise FileNotFoundError(f"Missing ML artifact file: {ML_ARTIFACT_PATH.name}")
-    if not ML_METADATA_PATH.exists():
-        raise FileNotFoundError(f"Missing ML metadata file: {ML_METADATA_PATH.name}")
-
-    model = joblib.load(ML_ARTIFACT_PATH)
-    with open(ML_METADATA_PATH, "r", encoding="utf-8") as f:
+def load_pair_artifact(instrument: str):
+    cfg = PAIR_CONFIG[instrument]
+    artifact_path = resolve_artifact_path(instrument, cfg["artifact"])
+    metadata_path = APP_DIR / cfg["metadata"]
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Missing metadata file: {metadata_path.name}")
+    model = joblib.load(artifact_path)
+    with open(metadata_path, "r", encoding="utf-8") as f:
         metadata = json.load(f)
     return model, metadata
 
@@ -504,104 +540,20 @@ def compute_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def build_ml_wide_base(df_eur: pd.DataFrame, df_gbp: pd.DataFrame) -> pd.DataFrame:
-    eur = df_eur.copy()
-    gbp = df_gbp.copy()
+def build_pair_feature_frame(df_mid: pd.DataFrame, instrument: str) -> pd.DataFrame:
+    cfg = PAIR_CONFIG[instrument]
+    prefix = cfg["prefix"]
 
-    eur["time"] = pd.to_datetime(eur["time"], utc=True, errors="coerce")
-    gbp["time"] = pd.to_datetime(gbp["time"], utc=True, errors="coerce")
-
-    eur = eur.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-    gbp = gbp.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-
-    eur["time_atl"] = eur["time"].dt.tz_convert(NY_TZ)
-    eur["atl_utc_offset_hours"] = eur["time_atl"].apply(lambda x: x.utcoffset().total_seconds() / 3600)
-    eur["atl_season_clock"] = eur["atl_utc_offset_hours"].map({-4.0: "EDT", -5.0: "EST"})
-    eur["atl_hour"] = eur["time_atl"].dt.hour
-    eur["month_of_year"] = eur["time_atl"].dt.month
-    eur["day_of_week"] = eur["time_atl"].dt.day_name()
-    eur["date_of_month"] = eur["time_atl"].dt.day
-    eur["is_atl_8am_candle"] = ((eur["time_atl"].dt.hour == 8) & (eur["time_atl"].dt.minute == 0))
-
-    base_cols = [
-        "time", "time_atl", "atl_season_clock", "atl_utc_offset_hours", "atl_hour",
-        "month_of_year", "day_of_week", "date_of_month", "is_atl_8am_candle"
-    ]
-
-    eur = eur[base_cols + ["open", "high", "low", "close", "volume"]].rename(columns={
-        "open": "eur_open", "high": "eur_high", "low": "eur_low", "close": "eur_close", "volume": "eur_volume"
-    })
-
-    gbp["time_atl"] = gbp["time"].dt.tz_convert(NY_TZ)
-    gbp["atl_utc_offset_hours"] = gbp["time_atl"].apply(lambda x: x.utcoffset().total_seconds() / 3600)
-    gbp["atl_season_clock"] = gbp["atl_utc_offset_hours"].map({-4.0: "EDT", -5.0: "EST"})
-    gbp["atl_hour"] = gbp["time_atl"].dt.hour
-    gbp["month_of_year"] = gbp["time_atl"].dt.month
-    gbp["day_of_week"] = gbp["time_atl"].dt.day_name()
-    gbp["date_of_month"] = gbp["time_atl"].dt.day
-    gbp["is_atl_8am_candle"] = ((gbp["time_atl"].dt.hour == 8) & (gbp["time_atl"].dt.minute == 0))
-    gbp = gbp[base_cols + ["open", "high", "low", "close", "volume"]].rename(columns={
-        "open": "gbp_open", "high": "gbp_high", "low": "gbp_low", "close": "gbp_close", "volume": "gbp_volume"
-    })
-
-    df = pd.merge(eur, gbp, on=base_cols, how="inner")
-    return df.sort_values("time").reset_index(drop=True)
-
-
-def engineer_eur_ml_features(df_base: pd.DataFrame) -> pd.DataFrame:
-    df = df_base.copy().sort_values("time").reset_index(drop=True)
-
-    df["eur_body"] = df["eur_close"] - df["eur_open"]
-    df["eur_range"] = df["eur_high"] - df["eur_low"]
-    df["eur_upper_wick"] = df["eur_high"] - df[["eur_open", "eur_close"]].max(axis=1)
-    df["eur_direction"] = df["eur_close"] - df["eur_open"]
-    df["eur_close_position"] = (df["eur_close"] - df["eur_low"]) / (df["eur_high"] - df["eur_low"] + 1e-9)
-    df["eur_body_ratio"] = df["eur_body"] / (df["eur_range"] + 1e-9)
-    df["eur_bullish_count_5"] = (df["eur_direction"] > 0).rolling(5).sum()
-    df["eur_return_1"] = df["eur_close"].pct_change()
-    df["eur_return_3"] = df["eur_close"].pct_change(3)
-    df["eur_ma_5"] = df["eur_close"].rolling(5).mean()
-    df["eur_ma_10"] = df["eur_close"].rolling(10).mean()
-    df["eur_ma_20"] = df["eur_close"].rolling(20).mean()
-    df["eur_ma_dist_5"] = df["eur_close"] - df["eur_ma_5"]
-    df["eur_ma_dist_20"] = df["eur_close"] - df["eur_ma_20"]
-    df["eur_ma_10_slope"] = df["eur_ma_10"] - df["eur_ma_10"].shift(1)
-    df["eur_volatility_5"] = df["eur_return_1"].rolling(5).std()
-    df["eur_tr"] = np.maximum.reduce([
-        df["eur_high"] - df["eur_low"],
-        (df["eur_high"] - df["eur_close"].shift(1)).abs(),
-        (df["eur_low"] - df["eur_close"].shift(1)).abs(),
-    ])
-    df["eur_atr_14"] = df["eur_tr"].rolling(14).mean()
-    df["eur_rsi_14"] = compute_rsi(df["eur_close"], 14)
-    df["is_sydney_open"] = ((df["atl_hour"] >= 17) | (df["atl_hour"] <= 2))
-    df["is_tokyo_open"] = ((df["atl_hour"] >= 19) | (df["atl_hour"] <= 4))
-    df["is_london_open"] = df["atl_hour"].between(3, 11)
-    df["pre_ny_return_3"] = df["eur_close"] / (df["eur_close"].shift(3) + 1e-9) - 1
-    df["pre_ny_return_6"] = df["eur_close"] / (df["eur_close"].shift(6) + 1e-9) - 1
-    df["london_session_return"] = df["eur_close"] / (df["eur_close"].shift(5) + 1e-9) - 1
-    df["asia_session_return"] = df["eur_close"] / (df["eur_close"].shift(8) + 1e-9) - 1
-    df["asia_vs_london_return_diff"] = df["asia_session_return"] - df["london_session_return"]
-    df["eur_rolling_high_10"] = df["eur_high"].rolling(10).max()
-    df["eur_rolling_low_10"] = df["eur_low"].rolling(10).min()
-    df["dist_to_high_24"] = df["eur_close"] - df["eur_high"].rolling(24).max()
-    df["dist_to_low_10"] = df["eur_close"] - df["eur_rolling_low_10"]
-    df["range_compression_10"] = df["eur_range"] / (df["eur_range"].rolling(10).mean() + 1e-9)
-    df["range_compression_20"] = df["eur_range"] / (df["eur_range"].rolling(20).mean() + 1e-9)
-    df["trend_strength"] = df["eur_ma_dist_5"].abs() / (df["eur_atr_14"] + 1e-9)
-    df["volatility_regime"] = (df["eur_volatility_5"].rolling(20).mean() > df["eur_volatility_5"].rolling(50).mean())
-    df["atr_regime"] = (df["eur_atr_14"] > df["eur_atr_14"].rolling(50).mean())
-    df["bullish_streak_3"] = (df["eur_direction"] > 0).rolling(3).sum()
-    df["bearish_streak_3"] = (df["eur_direction"] < 0).rolling(3).sum()
-    df["bullish_streak_5"] = (df["eur_direction"] > 0).rolling(5).sum()
-    df["daily_high_24"] = df["eur_high"].rolling(24).max()
-    df["daily_low_24"] = df["eur_low"].rolling(24).min()
-    df["position_in_daily_range"] = (df["eur_close"] - df["daily_low_24"]) / (df["daily_high_24"] - df["daily_low_24"] + 1e-9)
-    df["daily_range_24"] = df["daily_high_24"] - df["daily_low_24"]
-    df["daily_range_ratio"] = df["daily_range_24"] / (df["eur_atr_14"] + 1e-9)
-
-    day_map = {"Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6}
-    df["day_of_week_num"] = df["day_of_week"].map(day_map)
+    df = df_mid.copy().sort_values("time").reset_index(drop=True)
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["time"]).copy()
+    df["time_atl"] = df["time"].dt.tz_convert(NY_TZ)
+    df["atl_hour"] = df["time_atl"].dt.hour
+    df["month_of_year"] = df["time_atl"].dt.month
+    df["date_of_month"] = df["time_atl"].dt.day
+    df["day_of_week_num"] = df["time_atl"].dt.dayofweek
+    df["atl_utc_offset_hours"] = df["time_atl"].apply(lambda x: x.utcoffset().total_seconds() / 3600)
+    df["atl_season_clock_num"] = df["atl_utc_offset_hours"].map({-5.0: 0, -4.0: 1}).fillna(0)
     df["atl_hour_sin"] = np.sin(2 * np.pi * df["atl_hour"] / 24.0)
     df["atl_hour_cos"] = np.cos(2 * np.pi * df["atl_hour"] / 24.0)
     df["month_sin"] = np.sin(2 * np.pi * df["month_of_year"] / 12.0)
@@ -611,13 +563,101 @@ def engineer_eur_ml_features(df_base: pd.DataFrame) -> pd.DataFrame:
     df["day_of_week_sin"] = np.sin(2 * np.pi * df["day_of_week_num"] / 7.0)
     df["day_of_week_cos"] = np.cos(2 * np.pi * df["day_of_week_num"] / 7.0)
 
+    p = prefix
+    df[f"{p}_open"] = df["open"]
+    df[f"{p}_high"] = df["high"]
+    df[f"{p}_low"] = df["low"]
+    df[f"{p}_close"] = df["close"]
+    df[f"{p}_volume"] = df["volume"].fillna(0)
+
+    close_col = f"{p}_close"
+    open_col = f"{p}_open"
+    high_col = f"{p}_high"
+    low_col = f"{p}_low"
+
+    df[f"{p}_body"] = df[close_col] - df[open_col]
+    df[f"{p}_range"] = df[high_col] - df[low_col]
+    df[f"{p}_upper_wick"] = df[high_col] - df[[open_col, close_col]].max(axis=1)
+    df[f"{p}_lower_wick"] = df[[open_col, close_col]].min(axis=1) - df[low_col]
+    df[f"{p}_direction"] = df[close_col] - df[open_col]
+    df[f"{p}_close_position"] = (df[close_col] - df[low_col]) / (df[high_col] - df[low_col] + 1e-9)
+    df[f"{p}_body_ratio"] = df[f"{p}_body"] / (df[f"{p}_range"] + 1e-9)
+    df[f"{p}_return"] = df[close_col].pct_change()
+    df[f"{p}_return_1"] = df[close_col].pct_change(1)
+    df[f"{p}_return_3"] = df[close_col].pct_change(3)
+    df[f"{p}_return_5"] = df[close_col].pct_change(5)
+    df[f"{p}_return_lag_1"] = df[f"{p}_return"].shift(1)
+    df[f"{p}_log_return"] = np.log(df[close_col] / df[close_col].shift(1))
+    df[f"{p}_log_return_1"] = df[f"{p}_log_return"].shift(1)
+    df[f"{p}_ma_3"] = df[close_col].rolling(3).mean()
+    df[f"{p}_ma_5"] = df[close_col].rolling(5).mean()
+    df[f"{p}_ma_10"] = df[close_col].rolling(10).mean()
+    df[f"{p}_ma_20"] = df[close_col].rolling(20).mean()
+    df[f"{p}_ma_dist_5"] = df[close_col] - df[f"{p}_ma_5"]
+    df[f"{p}_ma_dist_10"] = df[close_col] - df[f"{p}_ma_10"]
+    df[f"{p}_ma_dist_20"] = df[close_col] - df[f"{p}_ma_20"]
+    df[f"{p}_ma_5_slope"] = df[f"{p}_ma_5"] - df[f"{p}_ma_5"].shift(1)
+    df[f"{p}_ma_10_slope"] = df[f"{p}_ma_10"] - df[f"{p}_ma_10"].shift(1)
+    df[f"{p}_volatility_5"] = df[f"{p}_return"].rolling(5).std()
+    df[f"{p}_volatility_10"] = df[f"{p}_return"].rolling(10).std()
+    df[f"{p}_volatility_20"] = df[f"{p}_return"].rolling(20).std()
+    df[f"{p}_volatility_ratio"] = df[f"{p}_volatility_5"] / (df[f"{p}_volatility_20"] + 1e-9)
+    df[f"{p}_tr"] = np.maximum.reduce([
+        df[high_col] - df[low_col],
+        (df[high_col] - df[close_col].shift(1)).abs(),
+        (df[low_col] - df[close_col].shift(1)).abs(),
+    ])
+    df[f"{p}_atr_14"] = df[f"{p}_tr"].rolling(14).mean()
+    df[f"{p}_rsi_14"] = compute_rsi(df[close_col], 14)
+    df[f"{p}_rolling_high_10"] = df[high_col].rolling(10).max()
+    df[f"{p}_rolling_low_10"] = df[low_col].rolling(10).min()
+    df[f"dist_to_high_10"] = df[close_col] - df[high_col].rolling(10).max()
+    df[f"dist_to_high_24"] = df[close_col] - df[high_col].rolling(24).max()
+    df[f"dist_to_low_10"] = df[close_col] - df[low_col].rolling(10).min()
+    df[f"dist_to_low_24"] = df[close_col] - df[low_col].rolling(24).min()
+    df["daily_high_24"] = df[high_col].rolling(24).max()
+    df["daily_low_24"] = df[low_col].rolling(24).min()
+    df["position_in_daily_range"] = (df[close_col] - df["daily_low_24"]) / (df["daily_high_24"] - df["daily_low_24"] + 1e-9)
+    df["daily_range_24"] = df["daily_high_24"] - df["daily_low_24"]
+    df["daily_range_ratio"] = df["daily_range_24"] / (df[f"{p}_atr_14"] + 1e-9)
+    df["pre_ny_return_3"] = df[close_col] / (df[close_col].shift(3) + 1e-9) - 1
+    df["pre_ny_return_6"] = df[close_col] / (df[close_col].shift(6) + 1e-9) - 1
+    df["pre_ny_momentum"] = df["pre_ny_return_3"] - df["pre_ny_return_6"]
+    df["london_session_return"] = df[close_col] / (df[close_col].shift(5) + 1e-9) - 1
+    df["asia_session_return"] = df[close_col] / (df[close_col].shift(8) + 1e-9) - 1
+    df["asia_vs_london_return_diff"] = df["asia_session_return"] - df["london_session_return"]
+    df["ny_vs_london_return_diff"] = df["pre_ny_return_3"] - df["london_session_return"]
+    df["london_move"] = df["london_session_return"]
+    df["trend_strength"] = (df[close_col] - df[f"{p}_ma_5"]).abs() / (df[f"{p}_atr_14"] + 1e-9)
+    df["trend_strength_20"] = (df[close_col] - df[f"{p}_ma_20"]).abs() / (df[f"{p}_atr_14"] + 1e-9)
+    df["volatility_regime"] = (df[f"{p}_volatility_5"].rolling(20).mean() > df[f"{p}_volatility_5"].rolling(50).mean()).astype(float)
+    df["atr_regime"] = (df[f"{p}_atr_14"] > df[f"{p}_atr_14"].rolling(50).mean()).astype(float)
+    df["range_compression_10"] = df[f"{p}_range"] / (df[f"{p}_range"].rolling(10).mean() + 1e-9)
+    df["range_compression_20"] = df[f"{p}_range"] / (df[f"{p}_range"].rolling(20).mean() + 1e-9)
+    df["bullish_streak_3"] = (df[f"{p}_direction"] > 0).rolling(3).sum()
+    df["bearish_streak_3"] = (df[f"{p}_direction"] < 0).rolling(3).sum()
+    df["bullish_streak_5"] = (df[f"{p}_direction"] > 0).rolling(5).sum()
+    df["bearish_streak_5"] = (df[f"{p}_direction"] < 0).rolling(5).sum()
+    df[f"{p}_bullish_count_5"] = (df[f"{p}_direction"] > 0).rolling(5).sum()
+    df[f"{p}_bearish_count_5"] = (df[f"{p}_direction"] < 0).rolling(5).sum()
+    df[f"{p}_direction_lag_1"] = df[f"{p}_direction"].shift(1)
+    df[f"{p}_direction_lag_3"] = df[f"{p}_direction"].shift(3)
+    df[f"{p}_dir_lag_3_num"] = np.sign(df[f"{p}_direction"].shift(3)).fillna(0)
+    df[f"{p}_dir_num_lag_3"] = np.sign(df[f"{p}_direction"].shift(3)).fillna(0)
+    df[f"{p}_trend_alignment"] = np.where(
+        (df[f"{p}_ma_3"] > df[f"{p}_ma_5"]) & (df[f"{p}_ma_5"] > df[f"{p}_ma_20"]),
+        1,
+        np.where((df[f"{p}_ma_3"] < df[f"{p}_ma_5"]) & (df[f"{p}_ma_5"] < df[f"{p}_ma_20"]), -1, 0),
+    )
+
     return df
 
 
-def build_eur_ml_prediction_log(df_eur: pd.DataFrame, df_gbp: pd.DataFrame, model, metadata: dict, viewer_tz_name: str) -> pd.DataFrame:
+def build_ml_prediction_log(df_mid: pd.DataFrame, instrument: str, model, metadata: dict, viewer_tz_name: str) -> pd.DataFrame:
     viewer_tz = ZoneInfo(viewer_tz_name)
-    df_base = build_ml_wide_base(df_eur, df_gbp)
-    df_feat = engineer_eur_ml_features(df_base)
+    cfg = PAIR_CONFIG[instrument]
+    prefix = cfg["prefix"]
+    df_feat = build_pair_feature_frame(df_mid, instrument)
 
     feature_cols = metadata.get("best_features", [])
     horizon = int(metadata.get("best_horizon", 1))
@@ -626,24 +666,27 @@ def build_eur_ml_prediction_log(df_eur: pd.DataFrame, df_gbp: pd.DataFrame, mode
             df_feat[col] = np.nan
 
     X = df_feat[feature_cols].copy()
+    X = X.replace([np.inf, -np.inf], np.nan)
+
     pred_num = model.predict(X)
     if hasattr(model, "predict_proba"):
         pred_prob = model.predict_proba(X)[:, 1]
     else:
         pred_prob = np.where(pred_num == 1, 1.0, 0.0)
 
+    close_col = f"{prefix}_close"
     df_feat["ml_prediction"] = np.where(pred_num == 1, "Bullish", "Bearish")
-    df_feat["future_close"] = df_feat["eur_close"].shift(-horizon)
+    df_feat["future_close"] = df_feat[close_col].shift(-horizon)
     df_feat["actual_num"] = np.where(
-        df_feat["future_close"] > df_feat["eur_close"],
+        df_feat["future_close"] > df_feat[close_col],
         1,
-        np.where(df_feat["future_close"] < df_feat["eur_close"], 0, np.nan),
+        np.where(df_feat["future_close"] < df_feat[close_col], 0, np.nan),
     )
-    df_feat["ml_actual"] = df_feat["actual_num"].map({1.0: "Bullish", 0.0: "Bearish"})
-    df_feat["ml_match_status"] = np.where(
-        df_feat["ml_actual"].isna(),
+    df_feat["actual"] = df_feat["actual_num"].map({1.0: "Bullish", 0.0: "Bearish"})
+    df_feat["ml_status"] = np.where(
+        df_feat["actual"].isna(),
         "Pending",
-        np.where(df_feat["ml_prediction"] == df_feat["ml_actual"], "Matched", "Mismatched"),
+        np.where(df_feat["ml_prediction"] == df_feat["actual"], "👑 Win", "❌ Loss"),
     )
     df_feat["prediction_time"] = pd.to_datetime(df_feat["time"], utc=True) + pd.Timedelta(hours=horizon)
     df_feat["viewer_time"] = df_feat["prediction_time"].dt.tz_convert(viewer_tz)
@@ -652,521 +695,341 @@ def build_eur_ml_prediction_log(df_eur: pd.DataFrame, df_gbp: pd.DataFrame, mode
 
     current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
     out = df_feat[df_feat["prediction_time"].dt.tz_convert(NY_TZ).dt.date == current_ny_day].copy()
-    out = out[["prediction_time", "viewer_time_display", "ml_prediction", "ml_actual", "ml_match_status", "ml_confidence"]].copy()
-    out.rename(columns={"prediction_time": "time", "viewer_time_display": "viewer_time"}, inplace=True)
+    out = out[["prediction_time", "viewer_time_display", "ml_prediction", "actual", "ml_confidence", "ml_status"]].copy()
+    out.rename(columns={"prediction_time": "time", "viewer_time_display": "viewer_time", "actual": "ml_actual"}, inplace=True)
     out["ml_actual"] = out["ml_actual"].fillna("Pending")
     return out.sort_values("time").reset_index(drop=True)
 
 
 # ============================================================
-# TABLE RENDERING
+# CONSOLIDATION / FINAL TABLES
 # ============================================================
-def combine_pair_logs(logs_by_pair: dict, viewer_tz_name: str) -> pd.DataFrame:
-    viewer_tz = ZoneInfo(viewer_tz_name)
-    combined = None
-
-    for pair, df in logs_by_pair.items():
-        short = PAIR_LABELS[pair]
-        tmp = df.copy()
-        tmp["time"] = pd.to_datetime(tmp["time"], utc=True)
-        tmp["viewer_time"] = tmp["time"].dt.tz_convert(viewer_tz)
-        tmp["viewer_time_display"] = tmp["viewer_time"].dt.strftime("%Y-%m-%d %H:%M %Z")
-
-        tmp = tmp[["time", "viewer_time_display", "prediction_for_this_row", "actual", "confidence", "match_status", "total_count"]].copy()
-        tmp.rename(
-            columns={
-                "viewer_time_display": "viewer_time",
-                "prediction_for_this_row": f"{short}_prediction",
-                "actual": f"{short}_actual",
-                "confidence": f"{short}_confidence",
-                "total_count": f"{short}_total_count",
-                "match_status": f"{short}_match_status",
-            },
-            inplace=True,
-        )
-
-        if combined is None:
-            combined = tmp
-        else:
-            combined = combined.merge(tmp, on=["time", "viewer_time"], how="outer")
-
-    combined = combined.sort_values("time").reset_index(drop=True)
-    return combined
-
-
-def render_prediction_cell(val):
-    val = "" if pd.isna(val) else str(val)
-    if val == "Bullish":
-        return '<span class="pill pred-bull">▲ Bullish</span>'
-    if val == "Bearish":
-        return '<span class="pill pred-bear">▼ Bearish</span>'
-    if val == "Doji":
-        return '<span class="pill pred-doji">● Doji</span>'
-    if val == "Unsure":
-        return '<span class="pill pred-unsure">? Unsure</span>'
-    if val == "Pending":
-        return '<span class="pill pred-pending">… Pending</span>'
-    return escape(val)
-
-
-def render_status_cell(val):
-    val = "" if pd.isna(val) else str(val)
-    if val == "Matched":
-        return '<span class="pill status-match">Matched</span>'
-    if val == "Mismatched":
-        return '<span class="pill status-mismatch">Mismatched</span>'
-    if val == "Unsure":
-        return '<span class="pill status-unsure">Unsure</span>'
-    if val == "Pending":
-        return '<span class="pill status-pending">Pending</span>'
-    return escape(val)
-
-
-def render_confidence_cell(val, total):
-    if pd.isna(val) or pd.isna(total) or total == 0:
-        return '<span class="muted">-</span>'
-    numerator = int(round(val * total))
-    pct = float(val) * 100
-    return f"{numerator}/{int(total)} <span class='muted'>({pct:.2f}%)</span>"
-
-
-def render_combined_prediction_table(df: pd.DataFrame, viewer_tz_name: str):
-    display_label = f"Time ({viewer_tz_name})"
-    rows_html = []
-
-    for _, row in df.iterrows():
-        rows_html.append(
-            "<tr>"
-            f"<td class='time-col'>{escape(str(row['viewer_time']))}</td>"
-            f"<td class='eur-col'>{render_prediction_cell(row.get('EUR_prediction'))}</td>"
-            f"<td class='eur-col'>{render_prediction_cell(row.get('EUR_actual'))}</td>"
-            f"<td class='eur-col'>{render_confidence_cell(row.get('EUR_confidence'), row.get('EUR_total_count'))}</td>"
-            f"<td class='eur-col'>{render_status_cell(row.get('EUR_match_status'))}</td>"
-            f"<td class='gbp-col'>{render_prediction_cell(row.get('GBP_prediction'))}</td>"
-            f"<td class='gbp-col'>{render_prediction_cell(row.get('GBP_actual'))}</td>"
-            f"<td class='gbp-col'>{render_confidence_cell(row.get('GBP_confidence'), row.get('GBP_total_count'))}</td>"
-            f"<td class='gbp-col'>{render_status_cell(row.get('GBP_match_status'))}</td>"
-            f"<td class='aud-col'>{render_prediction_cell(row.get('AUD_prediction'))}</td>"
-            f"<td class='aud-col'>{render_prediction_cell(row.get('AUD_actual'))}</td>"
-            f"<td class='aud-col'>{render_confidence_cell(row.get('AUD_confidence'), row.get('AUD_total_count'))}</td>"
-            f"<td class='aud-col'>{render_status_cell(row.get('AUD_match_status'))}</td>"
-            "</tr>"
-        )
-
-    html = f"""
-    <style>
-    .pred-log-wrap {{
-        width: 100%;
-        overflow-x: auto;
-        border: 1px solid rgba(120,120,120,0.22);
-        border-radius: 12px;
-        background: white;
-    }}
-    table.pred-log {{
-        width: 100%;
-        border-collapse: separate;
-        border-spacing: 0;
-        font-size: 13px;
-        min-width: 1480px;
-    }}
-    .pred-log th, .pred-log td {{
-        padding: 10px 12px;
-        border-bottom: 1px solid rgba(120,120,120,0.14);
-        text-align: left;
-        white-space: nowrap;
-    }}
-    .pred-log thead th {{
-        position: sticky;
-        top: 0;
-        z-index: 1;
-        font-weight: 700;
-    }}
-    .time-col {{ background: #f8fafc; }}
-    .eur-col {{ background: #eff6ff; }}
-    .gbp-col {{ background: #f0fdf4; }}
-    .aud-col {{ background: #fff7ed; }}
-    .eur-head {{ background: #dbeafe; }}
-    .gbp-head {{ background: #dcfce7; }}
-    .aud-head {{ background: #ffedd5; }}
-    .time-head {{ background: #e5e7eb; }}
-    .pill {{
-        display: inline-block;
-        padding: 4px 9px;
-        border-radius: 999px;
-        font-weight: 600;
-        font-size: 12px;
-    }}
-    .pred-bull {{ background: #dcfce7; color: #166534; }}
-    .pred-bear {{ background: #fee2e2; color: #991b1b; }}
-    .pred-doji {{ background: #fef3c7; color: #92400e; }}
-    .pred-unsure {{ background: #e5e7eb; color: #374151; }}
-    .pred-pending {{ background: #ede9fe; color: #5b21b6; }}
-    .status-match {{ background: #dcfce7; color: #166534; }}
-    .status-mismatch {{ background: #fee2e2; color: #991b1b; }}
-    .status-unsure {{ background: #e5e7eb; color: #374151; }}
-    .status-pending {{ background: #ede9fe; color: #5b21b6; }}
-    .muted {{ color: #6b7280; }}
-    </style>
-    <div class="pred-log-wrap">
-      <table class="pred-log">
-        <thead>
-          <tr>
-            <th class="time-head">{escape(display_label)}</th>
-            <th class="eur-head">EUR Prediction</th>
-            <th class="eur-head">EUR Actual</th>
-            <th class="eur-head">EUR Confidence</th>
-            <th class="eur-head">EUR Match Status</th>
-            <th class="gbp-head">GBP Prediction</th>
-            <th class="gbp-head">GBP Actual</th>
-            <th class="gbp-head">GBP Confidence</th>
-            <th class="gbp-head">GBP Match Status</th>
-            <th class="aud-head">AUD Prediction</th>
-            <th class="aud-head">AUD Actual</th>
-            <th class="aud-head">AUD Confidence</th>
-            <th class="aud-head">AUD Match Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(rows_html)}
-        </tbody>
-      </table>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
-
-
-def render_ml_prediction_table(df: pd.DataFrame, viewer_tz_name: str):
-    rows_html = []
-    for _, row in df.iterrows():
-        conf = "-" if pd.isna(row.get("ml_confidence")) else f"{float(row.get('ml_confidence')) * 100:.2f}%"
-        rows_html.append(
-            "<tr>"
-            f"<td class='time-col'>{escape(str(row['viewer_time']))}</td>"
-            f"<td class='eur-col'>{render_prediction_cell(row.get('ml_prediction'))}</td>"
-            f"<td class='eur-col'>{render_prediction_cell(row.get('ml_actual'))}</td>"
-            f"<td class='eur-col'>{render_status_cell(row.get('ml_match_status'))}</td>"
-            f"<td class='eur-col'>{conf}</td>"
-            "</tr>"
-        )
-
-    html = f"""
-    <div class="pred-log-wrap">
-      <table class="pred-log" style="min-width: 820px;">
-        <thead>
-          <tr>
-            <th class="time-head">Time ({escape(viewer_tz_name)})</th>
-            <th class="eur-head">EUR ML Prediction</th>
-            <th class="eur-head">EUR ML Actual</th>
-            <th class="eur-head">Match Status</th>
-            <th class="eur-head">Confidence</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(rows_html)}
-        </tbody>
-      </table>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
-
-
-# ============================================================
-# UI
-# ============================================================
-# Refresh only during the first minute of each hour.
-# Example: 09:00:00 to 09:00:59, 10:00:00 to 10:00:59, etc.
-
-def build_final_recommendation_table(prob_log_df: pd.DataFrame, ml_log_df: pd.DataFrame, viewer_tz_name: str) -> pd.DataFrame:
-    viewer_tz = ZoneInfo(viewer_tz_name)
-
-    prob_df = prob_log_df.copy()
-    ml_df = ml_log_df.copy()
-
-    prob_df["time"] = pd.to_datetime(prob_df["time"], utc=True, errors="coerce")
-    ml_df["time"] = pd.to_datetime(ml_df["time"], utc=True, errors="coerce")
-
-    prob_df = prob_df.rename(columns={
-        "prediction_for_this_row": "probabilities_prediction",
-        "actual": "probabilities_actual",
-        "confidence": "probabilities_confidence",
-        "match_status": "probabilities_match_status",
-    })
-
-    ml_df = ml_df.rename(columns={
-        "ml_prediction": "ml_prediction",
-        "ml_actual": "ml_actual",
-        "ml_confidence": "ml_confidence",
-        "ml_match_status": "ml_match_status",
-    })
-
-    merged = prob_df[[
-        "time", "probabilities_prediction", "probabilities_actual",
-        "probabilities_confidence", "probabilities_match_status"
-    ]].merge(
-        ml_df[["time", "ml_prediction", "ml_actual", "ml_confidence", "ml_match_status"]],
+def build_final_recommendation_table(prob_log_df: pd.DataFrame, ml_log_df: pd.DataFrame) -> pd.DataFrame:
+    df = prob_log_df[["time", "viewer_time_display", "probability_prediction", "actual", "probability_confidence", "probability_status"]].copy()
+    df = df.merge(
+        ml_log_df[["time", "ml_prediction", "ml_confidence", "ml_status", "ml_actual"]],
         on="time",
-        how="outer"
+        how="outer",
+    )
+    df["viewer_time_display"] = df["viewer_time_display"].fillna(
+        pd.to_datetime(df["time"], utc=True).dt.strftime("%Y-%m-%d %H:%M UTC")
     )
 
-    merged = merged.sort_values("time").reset_index(drop=True)
+    actual_col = np.where(df["actual"].notna(), df["actual"], df["ml_actual"])
+    df["actual_final"] = pd.Series(actual_col).fillna("Pending")
 
-    def final_reco(row):
-        p = row["probabilities_prediction"]
-        m = row["ml_prediction"]
-
-        if pd.isna(p) or pd.isna(m):
-            return "No trade identified"
-
-        if p in ["Bullish", "Bearish", "Doji"] and m in ["Bullish", "Bearish", "Doji"] and p == m:
-            return p
-
-        return "No trade identified"
-
-    merged["final_recommendation"] = merged.apply(final_reco, axis=1)
-
-    merged["actual"] = merged["probabilities_actual"].combine_first(merged["ml_actual"])
-    merged["actual"] = merged["actual"].fillna("Pending")
-
-    merged["confidence"] = np.where(
-        merged["probabilities_confidence"].notna() & merged["ml_confidence"].notna(),
-        (merged["probabilities_confidence"] + merged["ml_confidence"]) / 2,
-        np.nan
+    same_signal = (
+        df["probability_prediction"].isin(["Bullish", "Bearish"]) &
+        df["ml_prediction"].isin(["Bullish", "Bearish"]) &
+        (df["probability_prediction"] == df["ml_prediction"])
     )
+    df["final_prediction"] = np.where(same_signal, df["ml_prediction"], "Unsure")
+    df["final_confidence"] = np.where(same_signal, (df["probability_confidence"].fillna(0) + df["ml_confidence"].fillna(0)) / 2, np.nan)
 
-    def final_match_status(row):
-        reco = row["final_recommendation"]
-        actual = row["actual"]
-
-        if reco == "No trade identified":
-            return "No Trade"
+    def final_status(row):
+        pred = row["final_prediction"]
+        actual = row["actual_final"]
         if actual == "Pending":
             return "Pending"
-        return "Matched" if reco == actual else "Mismatched"
+        if pred == "Unsure":
+            return "🚫 No Trade"
+        return "👑 Win" if pred == actual else "❌ Loss"
 
-    merged["match_status"] = merged.apply(final_match_status, axis=1)
-
-    merged["Time (America/New_York)"] = merged["time"].dt.tz_convert(viewer_tz).dt.strftime("%Y-%m-%d %H:%M %Z")
-
-    out = merged[[
-        "Time (America/New_York)",
-        "probabilities_prediction",
-        "ml_prediction",
-        "final_recommendation",
-        "actual",
-        "confidence",
-        "match_status"
-    ]].copy()
-
-    out["confidence"] = np.where(
-        out["confidence"].notna(),
-        (out["confidence"] * 100).round(2).astype(str) + "%",
-        "-"
-    )
-
-    return out
+    df["final_status"] = df.apply(final_status, axis=1)
+    return df[[
+        "time", "viewer_time_display", "final_prediction", "actual_final", "final_confidence", "final_status",
+        "probability_prediction", "probability_confidence", "ml_prediction", "ml_confidence"
+    ]].sort_values("time").reset_index(drop=True)
 
 
-def sync_from_box(base_name):
-    st.session_state[base_name] = st.session_state[f"{base_name}_box"]
+def build_home_summary(pair_results: dict, viewer_tz_name: str) -> pd.DataFrame:
+    viewer_tz = ZoneInfo(viewer_tz_name)
+    rows = []
+    for instrument in PAIR_ORDER:
+        result = pair_results.get(instrument)
+        if result is None or result.get("final_table") is None or result["final_table"].empty:
+            rows.append({
+                "Viewer Time": "-",
+                "Currency Pair": PAIR_CONFIG[instrument]["display"],
+                "Prediction": "Unsure",
+                "Actual": "Pending",
+                "Status": "Pending",
+                "Confidence": np.nan,
+            })
+            continue
+        latest = result["final_table"].sort_values("time").iloc[-1]
+        view_time = pd.to_datetime(latest["time"], utc=True).tz_convert(viewer_tz).strftime("%Y-%m-%d %H:%M %Z")
+        rows.append({
+            "Viewer Time": view_time,
+            "Currency Pair": PAIR_CONFIG[instrument]["display"],
+            "Prediction": latest["final_prediction"],
+            "Actual": latest["actual_final"],
+            "Status": latest["final_status"],
+            "Confidence": latest["final_confidence"],
+        })
+    return pd.DataFrame(rows)
 
-def sync_from_slider(base_name):
-    st.session_state[base_name] = st.session_state[f"{base_name}_slider"]
 
-now_refresh_check = datetime.now(NY_TZ)
+def build_reports_table(pair_results: dict) -> pd.DataFrame:
+    pair_daily = {}
+    all_dates = set()
+    for instrument in PAIR_ORDER:
+        result = pair_results.get(instrument)
+        if result is None or result.get("final_table") is None or result["final_table"].empty:
+            pair_daily[instrument] = pd.DataFrame(columns=["date", "wins", "losses", "trades", "win_rate"])
+            continue
+        df = result["final_table"].copy()
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        df["date"] = df["time"].dt.tz_convert(NY_TZ).dt.date
+        df = df[df["final_prediction"].isin(["Bullish", "Bearish"])].copy()
+        if df.empty:
+            pair_daily[instrument] = pd.DataFrame(columns=["date", "wins", "losses", "trades", "win_rate"])
+            continue
+        df["win_flag"] = (df["final_status"] == "👑 Win").astype(int)
+        df["loss_flag"] = (df["final_status"] == "❌ Loss").astype(int)
+        daily = df.groupby("date", as_index=False).agg(wins=("win_flag", "sum"), losses=("loss_flag", "sum"))
+        daily["trades"] = daily["wins"] + daily["losses"]
+        daily["win_rate"] = np.where(daily["trades"] > 0, daily["wins"] / daily["trades"], np.nan)
+        pair_daily[instrument] = daily
+        all_dates.update(daily["date"].tolist())
 
-if now_refresh_check.minute == 0:
-    st_autorefresh(interval=30000, key="fx_top_of_hour_refresh_window")
+    if not all_dates:
+        return pd.DataFrame(columns=[
+            "Date", "EUR Wins", "EUR Losses", "EUR Win Rate", "GBP Wins", "GBP Losses", "GBP Win Rate",
+            "XAU Wins", "XAU Losses", "XAU Win Rate", "AUD Wins", "AUD Losses", "AUD Win Rate",
+            "JPY Wins", "JPY Losses", "JPY Win Rate", "Overall Win Rate"
+        ])
 
-st.title("FX Next Hour Prediction App | Design By Timothy Mandingwa")
-st.caption("Shows the next one-hour candle prediction using your historical pattern-probability logic.")
+    report = pd.DataFrame({"date": sorted(all_dates)})
+    total_wins = np.zeros(len(report), dtype=float)
+    total_losses = np.zeros(len(report), dtype=float)
 
-api_key = st.secrets.get("OANDA_API_KEY", os.getenv("OANDA_API_KEY", ""))
+    for instrument in PAIR_ORDER:
+        label = PAIR_CONFIG[instrument]["label"]
+        daily = pair_daily[instrument].copy()
+        report = report.merge(daily, on="date", how="left", suffixes=("", f"_{instrument}"))
+        wins_col = f"{label} Wins"
+        losses_col = f"{label} Losses"
+        win_rate_col = f"{label} Win Rate"
+        report[wins_col] = report["wins"].fillna(0) if "wins" in report.columns else 0
+        report[losses_col] = report["losses"].fillna(0) if "losses" in report.columns else 0
+        report[win_rate_col] = report["win_rate"] if "win_rate" in report.columns else np.nan
+        total_wins += report[wins_col].fillna(0).to_numpy(dtype=float)
+        total_losses += report[losses_col].fillna(0).to_numpy(dtype=float)
+        drop_cols = [c for c in ["wins", "losses", "trades", "win_rate"] if c in report.columns]
+        report.drop(columns=drop_cols, inplace=True)
+
+    report["Overall Win Rate"] = np.where((total_wins + total_losses) > 0, total_wins / (total_wins + total_losses), np.nan)
+    report.rename(columns={"date": "Date"}, inplace=True)
+    report = report.sort_values("Date", ascending=False).reset_index(drop=True)
+    return report
+
+
+# ============================================================
+# DISPLAY HELPERS
+# ============================================================
+def style_status_table(df: pd.DataFrame, percent_cols=None):
+    if percent_cols is None:
+        percent_cols = []
+    styled = df.copy()
+    for col in percent_cols:
+        if col in styled.columns:
+            styled[col] = styled[col].apply(lambda x: None if pd.isna(x) else x)
+    styler = styled.style
+    num_cols = [c for c in styled.columns if c in percent_cols]
+    if num_cols:
+        styler = styler.format({c: lambda x: "-" if pd.isna(x) else f"{x * 100:.2f}%" for c in num_cols})
+        styler = styler.background_gradient(cmap="YlGn", subset=num_cols)
+
+    def color_prediction(val):
+        if val == "Bullish":
+            return "background-color: #dcfce7; color: #166534; font-weight: 600;"
+        if val == "Bearish":
+            return "background-color: #fee2e2; color: #991b1b; font-weight: 600;"
+        if val == "Doji":
+            return "background-color: #fef3c7; color: #92400e; font-weight: 600;"
+        if val == "Unsure":
+            return "background-color: #e5e7eb; color: #374151; font-weight: 600;"
+        if val == "Pending":
+            return "background-color: #ede9fe; color: #5b21b6; font-weight: 600;"
+        return ""
+
+    def color_status(val):
+        if val == "👑 Win":
+            return "background-color: #dcfce7; color: #166534; font-weight: 700;"
+        if val == "❌ Loss":
+            return "background-color: #fee2e2; color: #991b1b; font-weight: 700;"
+        if val == "🚫 No Trade":
+            return "background-color: #e5e7eb; color: #374151; font-weight: 700;"
+        if val == "Pending":
+            return "background-color: #ede9fe; color: #5b21b6; font-weight: 700;"
+        return ""
+
+    pred_like = [c for c in styled.columns if "Prediction" in c or c == "Prediction"]
+    status_like = [c for c in styled.columns if "Status" in c or c == "Status"]
+    for col in pred_like:
+        styler = styler.map(color_prediction, subset=[col])
+    for col in status_like:
+        styler = styler.map(color_status, subset=[col])
+    return styler
+
+
+def render_pair_tab(instrument: str, result: dict):
+    title = PAIR_CONFIG[instrument]["display"]
+    final_df = result.get("final_table")
+    prob_df = result.get("prob_log")
+    ml_df = result.get("ml_log")
+
+    st.subheader(f"{title} Final Recommendation Table")
+    if final_df is None or final_df.empty:
+        st.info("Final recommendation table unavailable.")
+    else:
+        show = final_df.copy()
+        show.rename(columns={
+            "viewer_time_display": "Viewer Time",
+            "final_prediction": "Final Recommendation",
+            "actual_final": "Actual",
+            "final_confidence": "Confidence",
+            "final_status": "Status",
+            "probability_prediction": "Probability Prediction",
+            "probability_confidence": "Probability Confidence",
+            "ml_prediction": "ML Prediction",
+            "ml_confidence": "ML Confidence",
+        }, inplace=True)
+        st.dataframe(style_status_table(show[[
+            "Viewer Time", "Probability Prediction", "ML Prediction", "Final Recommendation",
+            "Actual", "Confidence", "Status"
+        ]], percent_cols=["Confidence"]).hide(axis="index"), width="stretch")
+
+    st.subheader(f"{title} Probabilities Prediction Log")
+    if prob_df is None or prob_df.empty:
+        st.info("Probability log unavailable.")
+    else:
+        show = prob_df.copy()
+        show.rename(columns={
+            "viewer_time_display": "Viewer Time",
+            "probability_prediction": "Probability Prediction",
+            "actual": "Actual",
+            "probability_confidence": "Confidence",
+            "probability_status": "Status",
+            "total_count": "Count",
+        }, inplace=True)
+        st.dataframe(style_status_table(show[["Viewer Time", "Probability Prediction", "Actual", "Confidence", "Status", "Count"]], percent_cols=["Confidence"]).hide(axis="index"), width="stretch")
+
+    st.subheader(f"{title} ML Prediction Log")
+    if ml_df is None or ml_df.empty:
+        st.info("ML prediction log unavailable.")
+    else:
+        show = ml_df.copy()
+        show.rename(columns={
+            "viewer_time": "Viewer Time",
+            "ml_prediction": "ML Prediction",
+            "ml_actual": "Actual",
+            "ml_confidence": "Confidence",
+            "ml_status": "Status",
+        }, inplace=True)
+        st.dataframe(style_status_table(show[["Viewer Time", "ML Prediction", "Actual", "Confidence", "Status"]], percent_cols=["Confidence"]).hide(axis="index"), width="stretch")
+
+
+# ============================================================
+# MAIN APP
+# ============================================================
+st.title("FX Multi-Pair Trading Dashboard")
+inject_auto_refresh()
+
+viewer_tz_name = detect_viewer_timezone()
+time_info = viewer_time_strings(viewer_tz_name)
 
 with st.sidebar:
     st.header("Settings")
+    st.caption("Probability engine defaults: lags = 6, history days = 270")
+    days_back = st.slider("History days", min_value=30, max_value=MAX_HISTORY_DAYS, value=DEFAULT_DAYS_BACK, step=10)
+    num_lags = st.slider("Number of lags", min_value=2, max_value=MAX_NUM_LAGS, value=DEFAULT_NUM_LAGS, step=1)
+    include_day_of_week = st.checkbox("Add day of week as part of key", value=False)
+    min_count_required = st.number_input("Minimum count required", min_value=1, max_value=100, value=MIN_COUNT_REQUIRED, step=1)
+    st.caption(f"Viewer timezone detected: {viewer_tz_name}")
+    st.caption("AUD, XAU, and JPY model artifacts auto-download from Google Drive if not found locally.")
 
-    if "days_back" not in st.session_state:
-        st.session_state["days_back"] = DEFAULT_DAYS_BACK
-    if "min_count_required" not in st.session_state:
-        st.session_state["min_count_required"] = MIN_COUNT_REQUIRED
-    if "num_lags" not in st.session_state:
-        st.session_state["num_lags"] = DEFAULT_NUM_LAGS
-
-    st.number_input(
-        "Days of history (box)",
-        min_value=90,
-        max_value=3000,
-        step=30,
-        key="days_back_box",
-        value=int(st.session_state["days_back"]),
-        on_change=sync_from_box,
-        args=("days_back",),
-    )
-    st.slider(
-        "Days of history",
-        min_value=90,
-        max_value=3000,
-        step=30,
-        key="days_back_slider",
-        value=int(st.session_state["days_back"]),
-        on_change=sync_from_slider,
-        args=("days_back",),
-    )
-
-    st.number_input(
-        "Minimum pattern count (box)",
-        min_value=1,
-        max_value=100,
-        step=1,
-        key="min_count_required_box",
-        value=int(st.session_state["min_count_required"]),
-        on_change=sync_from_box,
-        args=("min_count_required",),
-    )
-    st.slider(
-        "Minimum pattern count",
-        min_value=1,
-        max_value=20,
-        step=1,
-        key="min_count_required_slider",
-        value=int(st.session_state["min_count_required"]),
-        on_change=sync_from_slider,
-        args=("min_count_required",),
-    )
-
-    st.number_input(
-        "Number of lags (box)",
-        min_value=2,
-        max_value=12,
-        step=1,
-        key="num_lags_box",
-        value=int(st.session_state["num_lags"]),
-        on_change=sync_from_box,
-        args=("num_lags",),
-    )
-    st.slider(
-        "Number of lags",
-        min_value=2,
-        max_value=12,
-        step=1,
-        key="num_lags_slider",
-        value=int(st.session_state["num_lags"]),
-        on_change=sync_from_slider,
-        args=("num_lags",),
-    )
-
-days_back = int(st.session_state["days_back"])
-min_count_required = int(st.session_state["min_count_required"])
-num_lags = int(st.session_state["num_lags"])
-
-viewer_tz_name = detect_viewer_timezone()
-try:
-    VIEWER_TZ = ZoneInfo(viewer_tz_name)
-except Exception:
-    viewer_tz_name = "America/New_York"
-    VIEWER_TZ = NY_TZ
-
-now_ny = datetime.now(NY_TZ)
-now_utc = datetime.now(UTC_TZ)
-now_viewer = datetime.now(VIEWER_TZ)
-
-c1, c2, c3 = st.columns(3)
-c1.metric("Current Viewer Time", now_viewer.strftime("%Y-%m-%d %H:%M:%S %Z"))
-c2.metric("Current UTC Time", now_utc.strftime("%Y-%m-%d %H:%M:%S %Z"))
-c3.metric("Viewer Time Zone", viewer_tz_name)
-
-st.subheader("Market Session Status")
-st.dataframe(next_session_status_block(now_ny, viewer_tz_name), width="stretch", hide_index=True)
-
+api_key = st.secrets.get("OANDA_API_KEY", "") if hasattr(st, "secrets") else ""
 if not api_key:
-    st.error("Missing OANDA API key. Add OANDA_API_KEY to Streamlit secrets before deploying.")
+    st.error("Missing OANDA_API_KEY in Streamlit secrets.")
     st.stop()
 
-try:
-    logs_by_pair = {}
-    next_preds = {}
+pair_results = {}
+raw_data = {}
 
-    with st.spinner("Fetching live candles and generating next-hour predictions for all pairs..."):
-        for instrument in PAIRS:
+try:
+    with st.spinner("Fetching live candles, building probability pipeline, and scoring all ML models..."):
+        for instrument in PAIR_ORDER:
             df_mid = fetch_oanda_candles(api_key, instrument, days_back)
+            raw_data[instrument] = df_mid
             if df_mid.empty:
+                pair_results[instrument] = {"error": "No data returned from OANDA."}
                 continue
+
             df_tz = prepare_df_tz(df_mid)
-            df_pattern = build_pattern_dataset(df_tz, num_lags=num_lags)
+            df_pattern = build_pattern_dataset(df_tz, num_lags=num_lags, include_day_of_week=include_day_of_week)
             key_summary = summarise_keys(df_pattern, min_count_required=min_count_required)
             next_pred = predict_next_hour(df_pattern, key_summary)
-            recent_table = build_intraday_prediction_table(df_pattern, key_summary, next_pred, num_lags=num_lags)
-            logs_by_pair[instrument] = recent_table
-            next_preds[instrument] = next_pred
+            prob_log = build_probability_log(df_pattern, key_summary, next_pred, viewer_tz_name, num_lags)
 
-    if not logs_by_pair:
-        st.error("No candle data returned from OANDA for the selected pairs.")
-        st.stop()
+            ml_log = None
+            final_table = None
+            ml_error = None
+            try:
+                model, metadata = load_pair_artifact(instrument)
+                ml_log = build_ml_prediction_log(df_mid, instrument, model, metadata, viewer_tz_name)
+                final_table = build_final_recommendation_table(prob_log, ml_log)
 
-    st.subheader("Next Hour Prediction")
-    pair_cols = st.columns(3)
-    for i, instrument in enumerate(PAIRS):
-        with pair_cols[i]:
-            pred = next_preds.get(instrument)
-            if pred is None:
-                st.warning(f"{PAIR_LABELS[instrument]} data unavailable")
-            else:
-                st.markdown(f"**{PAIR_LABELS[instrument]}**")
-                st.metric("Prediction", pred["prediction_label"])
-                st.metric("Confidence", "-" if pd.isna(pred["confidence"]) else f"{pred['confidence']:.2%}")
-                st.metric("Next Candle", pred["future_time_ny"].strftime("%Y-%m-%d %H:%M"))
+            except Exception as e:
+                st.error(f"ML load failed for {instrument}: {type(e).__name__}: {e}")
 
+            pair_results[instrument] = {
+                "prob_log": prob_log,
+                "ml_log": ml_log,
+                "final_table": final_table,
+                "ml_error": ml_error,
+            }
 
-    ml_log_df = None
+    tabs = st.tabs(["Home", "EUR", "GBP", "XAU", "AUD", "JPY", "Reports"])
 
-    st.subheader("EURUSD ML Prediction Log")
-    try:
-        ml_model, ml_metadata = load_eur_ml_artifacts()
-        if "EUR_USD" in logs_by_pair and "GBP_USD" in logs_by_pair:
-            eur_df = fetch_oanda_candles(api_key, "EUR_USD", max(days_back, 120))
-            gbp_df = fetch_oanda_candles(api_key, "GBP_USD", max(days_back, 120))
-            ml_log_df = build_eur_ml_prediction_log(eur_df, gbp_df, ml_model, ml_metadata, viewer_tz_name)
-            render_ml_prediction_table(ml_log_df, viewer_tz_name)
+    with tabs[0]:
+        st.subheader("Current Time Snapshot")
+        a, b, c = st.columns(3)
+        a.metric("Current viewer time", time_info["viewer_str"])
+        b.metric("UTC time", time_info["utc_str"])
+        c.metric("ATL time", time_info["atl_str"])
+
+        st.subheader("Market Session Status")
+        session_df = market_session_status(time_info["atl"], viewer_tz_name)
+        st.dataframe(session_df, width="stretch", hide_index=True)
+
+        st.subheader("Consolidated Summary Table")
+        home_df = build_home_summary(pair_results, viewer_tz_name)
+        st.dataframe(style_status_table(home_df, percent_cols=["Confidence"]).hide(axis="index"), width="stretch")
+
+    tab_map = {1: "EUR_USD", 2: "GBP_USD", 3: "XAU_USD", 4: "AUD_USD", 5: "USD_JPY"}
+    for idx, instrument in tab_map.items():
+        with tabs[idx]:
+            if pair_results.get(instrument, {}).get("ml_error"):
+                st.warning(f"ML model note: {pair_results[instrument]['ml_error']}")
+            render_pair_tab(instrument, pair_results.get(instrument, {}))
+
+    with tabs[6]:
+        st.subheader("Daily Reports")
+        reports_df = build_reports_table(pair_results)
+        if reports_df.empty:
+            st.info("No completed final trades yet for the current loaded data window.")
         else:
-            st.info("EURUSD ML table unavailable because EUR or GBP price history is missing.")
-    except Exception as ml_err:
-        st.warning(f"EURUSD ML table not loaded: {ml_err}")
+            percent_cols = [c for c in reports_df.columns if "Win Rate" in c]
+            st.dataframe(style_status_table(reports_df, percent_cols=percent_cols).hide(axis="index"), width="stretch")
 
-    st.subheader("EURUSD Final Recommendation Table")
-    try:
-        eur_prob_log = logs_by_pair.get("EUR_USD")
-        if eur_prob_log is not None and ml_log_df is not None:
-            final_reco_df = build_final_recommendation_table(eur_prob_log, ml_log_df, viewer_tz_name)
-            st.dataframe(final_reco_df, width="stretch", hide_index=True)
-        else:
-            st.info("EURUSD final recommendation table unavailable.")
-    except Exception as reco_err:
-        st.warning(f"Final recommendation table not loaded: {reco_err}")
-
-    st.subheader("Today’s Prediction Log")
-    combined_log = combine_pair_logs(logs_by_pair, viewer_tz_name)
-    render_combined_prediction_table(combined_log, viewer_tz_name)
-    
-
-    csv_df = combined_log.copy()
-    for col in csv_df.columns:
-        if col.endswith("_confidence"):
-            csv_df[col] = np.where(csv_df[col].notna(), (csv_df[col] * 100).round(2).astype(str) + "%", "-")
-    csv_df["time"] = pd.to_datetime(csv_df["time"], utc=True).dt.strftime("%Y-%m-%d %H:%M UTC")
-    csv_data = csv_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download prediction table CSV",
-        data=csv_data,
-        file_name="fx_multi_pair_prediction_log.csv",
-        mime="text/csv",
-    )
-
-except requests.HTTPError as e:
-    st.error(f"OANDA API error: {e}")
-except Exception as e:
-    st.exception(e)
+except requests.HTTPError as exc:
+    st.error(f"OANDA API error: {exc}")
+except Exception as exc:
+    st.exception(exc)
 
 st.markdown("---")
 st.markdown(
-    "**Deploy online:** upload this file as `app.py`, keep `best_model_artifact.joblib` and `best_model_metadata.json` in the same repo, add `OANDA_API_KEY` in Streamlit secrets, and deploy on Streamlit Community Cloud."
+    "Deploy this file as `app.py`. Keep all metadata JSON files in the repo. EUR and GBP artifacts can stay in the repo, while AUD, XAU, and JPY artifacts can be downloaded automatically from Google Drive on first run. Add `OANDA_API_KEY` in Streamlit secrets and set the Google Drive files to `Anyone with the link -> Viewer`."
 )
