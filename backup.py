@@ -17,6 +17,12 @@ try:
 except Exception:
     st_javascript = None
 
+# Optional dependency used by some saved artifacts (AUD / GBP in some versions)
+try:
+    import xgboost  # noqa: F401
+except Exception:
+    xgboost = None
+
 st.set_page_config(page_title="FX Multi-Pair Trading Dashboard", layout="wide")
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -522,12 +528,126 @@ def load_pair_artifact(instrument: str):
     cfg = PAIR_CONFIG[instrument]
     artifact_path = resolve_artifact_path(instrument, cfg["artifact"])
     metadata_path = APP_DIR / cfg["metadata"]
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"Missing metadata file: {metadata_path.name}")
+
     model = joblib.load(artifact_path)
-    with open(metadata_path, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
+
+    metadata = {}
+    if metadata_path.exists():
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+
+    if not isinstance(metadata, dict):
+        metadata = {}
+
     return model, metadata
+
+
+def resolve_feature_columns(model, metadata: dict) -> list:
+    for key in ["best_features", "feature_names", "selected_features", "features"]:
+        val = metadata.get(key)
+        if isinstance(val, list) and len(val) > 0:
+            return val
+
+    if isinstance(model, dict):
+        for key in ["feature_names", "best_features", "selected_features", "features"]:
+            val = model.get(key)
+            if isinstance(val, list) and len(val) > 0:
+                return val
+
+    return []
+
+
+def resolve_horizon(model, metadata: dict) -> int:
+    candidate_keys = ["best_horizon", "horizon", "forecast_horizon", "target_horizon"]
+    for key in candidate_keys:
+        val = metadata.get(key)
+        try:
+            if val is not None:
+                return max(int(val), 1)
+        except Exception:
+            pass
+
+    if isinstance(model, dict):
+        for key in candidate_keys:
+            val = model.get(key)
+            try:
+                if val is not None:
+                    return max(int(val), 1)
+            except Exception:
+                pass
+
+    return 1
+
+
+def _coerce_1d_array(x, length_hint=None):
+    arr = np.asarray(x)
+    if arr.ndim == 0:
+        arr = np.repeat(arr, length_hint if length_hint is not None else 1)
+    return arr.reshape(-1)
+
+
+def predict_with_loaded_artifact(model, X: pd.DataFrame):
+    if hasattr(model, "predict"):
+        pred_num = _coerce_1d_array(model.predict(X), len(X))
+        if hasattr(model, "predict_proba"):
+            pred_prob = np.asarray(model.predict_proba(X))
+            if pred_prob.ndim == 2 and pred_prob.shape[1] >= 2:
+                pred_prob = pred_prob[:, 1]
+            else:
+                pred_prob = pred_prob.reshape(-1)
+        else:
+            pred_prob = np.where(pred_num == 1, 1.0, 0.0)
+        return pred_num.astype(float), _coerce_1d_array(pred_prob, len(X)).astype(float)
+
+    if isinstance(model, dict):
+        model_type = str(model.get("type", "")).lower()
+        base_models = model.get("base_models_final", {})
+        meta_model = model.get("meta_model")
+
+        if model_type in {"manual_stacking", "stacking", "stacked"} and isinstance(base_models, dict) and meta_model is not None:
+            member_names = model.get("members") or list(base_models.keys())
+            stack_parts = []
+            fallback_pred = []
+
+            for member in member_names:
+                est = base_models.get(member)
+                if est is None:
+                    continue
+                if hasattr(est, "predict_proba"):
+                    proba = np.asarray(est.predict_proba(X))
+                    if proba.ndim == 2 and proba.shape[1] >= 2:
+                        pos = proba[:, 1]
+                    else:
+                        pos = proba.reshape(-1)
+                else:
+                    pred = _coerce_1d_array(est.predict(X), len(X)).astype(float)
+                    pos = pred
+                pos = _coerce_1d_array(pos, len(X)).astype(float)
+                stack_parts.append(pos.reshape(-1, 1))
+                fallback_pred.append(pos)
+
+            if not stack_parts:
+                raise ValueError("Manual stacking artifact has no usable base models.")
+
+            X_meta = np.hstack(stack_parts)
+            meta_pred = _coerce_1d_array(meta_model.predict(X_meta), len(X)).astype(float)
+
+            if hasattr(meta_model, "predict_proba"):
+                meta_proba = np.asarray(meta_model.predict_proba(X_meta))
+                if meta_proba.ndim == 2 and meta_proba.shape[1] >= 2:
+                    meta_proba = meta_proba[:, 1]
+                else:
+                    meta_proba = meta_proba.reshape(-1)
+            else:
+                avg_base = np.mean(np.column_stack(fallback_pred), axis=1)
+                meta_proba = np.where(meta_pred == 1, avg_base, 1 - avg_base)
+
+            return meta_pred, _coerce_1d_array(meta_proba, len(X)).astype(float)
+
+        if "model" in model and hasattr(model["model"], "predict"):
+            return predict_with_loaded_artifact(model["model"], X)
+
+    raise TypeError(f"Unsupported artifact object for prediction: {type(model).__name__}")
 
 
 def compute_rsi(series, period=14):
@@ -659,8 +779,12 @@ def build_ml_prediction_log(df_mid: pd.DataFrame, instrument: str, model, metada
     prefix = cfg["prefix"]
     df_feat = build_pair_feature_frame(df_mid, instrument)
 
-    feature_cols = metadata.get("best_features", [])
-    horizon = int(metadata.get("best_horizon", 1))
+    feature_cols = resolve_feature_columns(model, metadata)
+    if not feature_cols:
+        raise ValueError(f"No feature list found for {instrument} artifact / metadata.")
+
+    horizon = resolve_horizon(model, metadata)
+
     for col in feature_cols:
         if col not in df_feat.columns:
             df_feat[col] = np.nan
@@ -668,11 +792,9 @@ def build_ml_prediction_log(df_mid: pd.DataFrame, instrument: str, model, metada
     X = df_feat[feature_cols].copy()
     X = X.replace([np.inf, -np.inf], np.nan)
 
-    pred_num = model.predict(X)
-    if hasattr(model, "predict_proba"):
-        pred_prob = model.predict_proba(X)[:, 1]
-    else:
-        pred_prob = np.where(pred_num == 1, 1.0, 0.0)
+    pred_num, pred_prob = predict_with_loaded_artifact(model, X)
+    pred_num = np.where(pred_num >= 0.5, 1, 0).astype(int)
+    pred_prob = np.clip(np.asarray(pred_prob, dtype=float), 0.0, 1.0)
 
     close_col = f"{prefix}_close"
     df_feat["ml_prediction"] = np.where(pred_num == 1, "Bullish", "Bearish")
@@ -704,8 +826,23 @@ def build_ml_prediction_log(df_mid: pd.DataFrame, instrument: str, model, metada
 # ============================================================
 # CONSOLIDATION / FINAL TABLES
 # ============================================================
-def build_final_recommendation_table(prob_log_df: pd.DataFrame, ml_log_df: pd.DataFrame) -> pd.DataFrame:
+def build_final_recommendation_table(prob_log_df: pd.DataFrame, ml_log_df: pd.DataFrame | None) -> pd.DataFrame:
     df = prob_log_df[["time", "viewer_time_display", "probability_prediction", "actual", "probability_confidence", "probability_status"]].copy()
+
+    if ml_log_df is None or ml_log_df.empty:
+        df["ml_prediction"] = np.nan
+        df["ml_confidence"] = np.nan
+        df["ml_status"] = np.nan
+        df["ml_actual"] = np.nan
+        df["actual_final"] = df["actual"].fillna("Pending")
+        df["final_prediction"] = df["probability_prediction"].fillna("Unsure")
+        df["final_confidence"] = df["probability_confidence"]
+        df["final_status"] = df["probability_status"].fillna("Pending")
+        return df[[
+            "time", "viewer_time_display", "final_prediction", "actual_final", "final_confidence", "final_status",
+            "probability_prediction", "probability_confidence", "ml_prediction", "ml_confidence"
+        ]].sort_values("time").reset_index(drop=True)
+
     df = df.merge(
         ml_log_df[["time", "ml_prediction", "ml_confidence", "ml_status", "ml_actual"]],
         on="time",
@@ -723,8 +860,32 @@ def build_final_recommendation_table(prob_log_df: pd.DataFrame, ml_log_df: pd.Da
         df["ml_prediction"].isin(["Bullish", "Bearish"]) &
         (df["probability_prediction"] == df["ml_prediction"])
     )
-    df["final_prediction"] = np.where(same_signal, df["ml_prediction"], "Unsure")
-    df["final_confidence"] = np.where(same_signal, (df["probability_confidence"].fillna(0) + df["ml_confidence"].fillna(0)) / 2, np.nan)
+
+    prob_only_ok = (
+        df["probability_prediction"].isin(["Bullish", "Bearish"]) &
+        ~df["ml_prediction"].isin(["Bullish", "Bearish"])
+    )
+
+    ml_only_ok = (
+        df["ml_prediction"].isin(["Bullish", "Bearish"]) &
+        ~df["probability_prediction"].isin(["Bullish", "Bearish"])
+    )
+
+    df["final_prediction"] = np.select(
+        [same_signal, prob_only_ok, ml_only_ok],
+        [df["ml_prediction"], df["probability_prediction"], df["ml_prediction"]],
+        default="Unsure",
+    )
+
+    df["final_confidence"] = np.select(
+        [same_signal, prob_only_ok, ml_only_ok],
+        [
+            (df["probability_confidence"].fillna(0) + df["ml_confidence"].fillna(0)) / 2,
+            df["probability_confidence"].fillna(np.nan),
+            df["ml_confidence"].fillna(np.nan),
+        ],
+        default=np.nan,
+    )
 
     def final_status(row):
         pred = row["final_prediction"]
@@ -974,15 +1135,15 @@ try:
             prob_log = build_probability_log(df_pattern, key_summary, next_pred, viewer_tz_name, num_lags)
 
             ml_log = None
-            final_table = None
             ml_error = None
             try:
                 model, metadata = load_pair_artifact(instrument)
                 ml_log = build_ml_prediction_log(df_mid, instrument, model, metadata, viewer_tz_name)
-                final_table = build_final_recommendation_table(prob_log, ml_log)
-
             except Exception as e:
-                st.error(f"ML load failed for {instrument}: {type(e).__name__}: {e}")
+                ml_error = f"{type(e).__name__}: {e}"
+                st.error(f"ML load failed for {instrument}: {ml_error}")
+
+            final_table = build_final_recommendation_table(prob_log, ml_log)
 
             pair_results[instrument] = {
                 "prob_log": prob_log,
