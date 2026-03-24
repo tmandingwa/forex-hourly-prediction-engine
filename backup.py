@@ -79,22 +79,16 @@ MIN_COUNT_REQUIRED = 5
 DEFAULT_DAYS_BACK = 270
 DEFAULT_NUM_LAGS = 6
 PAIR_DEFAULT_LAGS = {
-    "EUR_USD": 6,
+    "EUR_USD": 3,
     "GBP_USD": 10,
-    "XAU_USD": 6,
+    "XAU_USD": 10,
     "AUD_USD": 6,
-    "USD_JPY": 10,
+    "USD_JPY": 6,
 }
 MAX_NUM_LAGS = 15
 MAX_HISTORY_DAYS = 2500
 APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = APP_DIR / "models"
-
-GOOGLE_DRIVE_FILE_IDS = {
-    "AUD_USD": "178xJSdurCZQh3WR4S-VIJHJenvY9JOPJ",
-    "USD_JPY": "1pzJctNp9W64OVXq7116DmrEkPslwt2M-",
-    "XAU_USD": "1D19KhexIsQ_bNyvPr0hAzTPmuG1Ld5vl",
-}
 
 
 # ============================================================
@@ -268,39 +262,6 @@ def market_session_status(now_ny: datetime, viewer_tz_name: str) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
-def download_large_file_from_google_drive(file_id: str, destination: Path) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        return destination
-
-    url = "https://drive.google.com/uc?export=download"
-    session = requests.Session()
-    response = session.get(url, params={"id": file_id}, stream=True, timeout=120)
-
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            token = value
-            break
-
-    if token:
-        response.close()
-        response = session.get(
-            url,
-            params={"id": file_id, "confirm": token},
-            stream=True,
-            timeout=120,
-        )
-
-    response.raise_for_status()
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-    response.close()
-    return destination
-
-
 def resolve_artifact_path(instrument: str, artifact_name: str) -> Path:
     search_paths = [
         APP_DIR / artifact_name,
@@ -310,12 +271,10 @@ def resolve_artifact_path(instrument: str, artifact_name: str) -> Path:
     for p in search_paths:
         if p.exists():
             return p
-
-    file_id = GOOGLE_DRIVE_FILE_IDS.get(instrument)
-    if not file_id:
-        raise FileNotFoundError(f"Missing artifact file: {artifact_name}")
-
-    return download_large_file_from_google_drive(file_id, MODEL_DIR / artifact_name)
+    raise FileNotFoundError(
+        f"Missing local artifact file for {instrument}: {artifact_name}. "
+        f"Place it in the app folder, current working directory, or models/ folder."
+    )
 
 
 # ============================================================
@@ -944,27 +903,61 @@ def build_home_summary(pair_results: dict, viewer_tz_name: str) -> pd.DataFrame:
     rows = []
     for instrument in PAIR_ORDER:
         result = pair_results.get(instrument)
-        if result is None or result.get("final_table") is None or result["final_table"].empty:
-            rows.append({
-                "Viewer Time": "-",
-                "Currency Pair": PAIR_CONFIG[instrument]["display"],
-                "Prediction": "Unsure",
-                "Actual": "Pending",
-                "Status": "Pending",
-                "Confidence": np.nan,
-            })
+        final_df = None if result is None else result.get("final_table")
+        if final_df is None or final_df.empty:
             continue
-        latest = result["final_table"].sort_values("time", ascending=False).iloc[0]
-        view_time = pd.to_datetime(latest["time"], utc=True).tz_convert(viewer_tz).strftime("%Y-%m-%d %H:%M %Z")
-        rows.append({
-            "Viewer Time": view_time,
-            "Currency Pair": PAIR_CONFIG[instrument]["display"],
-            "Prediction": latest["final_prediction"],
-            "Actual": latest["actual_final"],
-            "Status": latest["final_status"],
-            "Confidence": latest["final_confidence"],
-        })
-    return pd.DataFrame(rows)
+
+        df = final_df.copy()
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+        df = df.dropna(subset=["time"]).copy()
+        if df.empty:
+            continue
+
+        df["ny_date"] = df["time"].dt.tz_convert(NY_TZ).dt.date
+        current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
+        df = df[df["ny_date"] == current_ny_day].copy()
+        if df.empty:
+            continue
+
+        for _, row in df.iterrows():
+            rows.append({
+                "sort_time": row["time"],
+                "Viewer Time": row["time"].tz_convert(viewer_tz).strftime("%Y-%m-%d %H:%M %Z"),
+                "Currency Pair": PAIR_CONFIG[instrument]["display"],
+                "Prediction": row.get("final_prediction", "Unsure"),
+                "Actual": row.get("actual_final", "Pending"),
+                "Status": row.get("final_status", "Pending"),
+                "Confidence": row.get("final_confidence", np.nan),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["Viewer Time", "Currency Pair", "Prediction", "Actual", "Status", "Confidence"])
+
+    out = pd.DataFrame(rows).sort_values("sort_time", ascending=False).reset_index(drop=True)
+    return out[["Viewer Time", "Currency Pair", "Prediction", "Actual", "Status", "Confidence"]]
+
+
+def get_home_summary_stats(pair_results: dict) -> dict:
+    wins = 0
+    losses = 0
+    for instrument in PAIR_ORDER:
+        result = pair_results.get(instrument)
+        final_df = None if result is None else result.get("final_table")
+        if final_df is None or final_df.empty:
+            continue
+        df = final_df.copy()
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+        df = df.dropna(subset=["time"]).copy()
+        if df.empty:
+            continue
+        current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
+        df = df[df["time"].dt.tz_convert(NY_TZ).dt.date == current_ny_day].copy()
+        wins += int((df["final_status"] == "👑 Win").sum())
+        losses += int((df["final_status"] == "❌ Loss").sum())
+
+    total = wins + losses
+    win_rate = wins / total if total > 0 else np.nan
+    return {"wins": wins, "losses": losses, "win_rate": win_rate}
 
 
 def build_reports_table(pair_results: dict) -> pd.DataFrame:
@@ -1140,24 +1133,16 @@ time_info = viewer_time_strings(viewer_tz_name)
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("Probability engine defaults by pair: EUR=6, GBP=10, XAU=6, AUD=6, JPY=10; history days = 270")
+    st.caption("Probability engine defaults by pair: EUR=3, GBP=10, XAU=10, AUD=6, JPY=6; history days = 270")
     days_back = st.slider("History days", min_value=30, max_value=MAX_HISTORY_DAYS, value=DEFAULT_DAYS_BACK, step=10)
     include_day_of_week = st.checkbox("Add day of week as part of key", value=False)
     min_count_required = st.number_input("Minimum count required", min_value=1, max_value=100, value=MIN_COUNT_REQUIRED, step=1)
-    st.markdown("**Per-pair lag settings**")
-    pair_lag_settings = {}
+    st.markdown("**Fixed per-pair lag settings**")
+    pair_lag_settings = PAIR_DEFAULT_LAGS.copy()
     for instrument in PAIR_ORDER:
-        label = PAIR_CONFIG[instrument]["display"]
-        pair_lag_settings[instrument] = st.slider(
-            f"{label} lags",
-            min_value=2,
-            max_value=MAX_NUM_LAGS,
-            value=PAIR_DEFAULT_LAGS.get(instrument, DEFAULT_NUM_LAGS),
-            step=1,
-            key=f"lags_{instrument}",
-        )
+        st.caption(f"{PAIR_CONFIG[instrument]['display']}: {pair_lag_settings[instrument]} lags")
     st.caption(f"Viewer timezone detected: {viewer_tz_name}")
-    st.caption("AUD, XAU, and JPY model artifacts auto-download from Google Drive if not found locally.")
+    st.caption("All model artifacts are loaded locally from the deployment folder or models/ directory.")
 
 api_key = st.secrets.get("OANDA_API_KEY", "") if hasattr(st, "secrets") else ""
 if not api_key:
@@ -1215,9 +1200,16 @@ try:
         session_df = market_session_status(time_info["atl"], viewer_tz_name)
         st.dataframe(session_df, width="stretch", hide_index=True)
 
-        st.subheader("Consolidated Summary Table")
         home_df = build_home_summary(pair_results, viewer_tz_name)
-        st.dataframe(style_status_table(home_df, percent_cols=["Confidence"]).hide(axis="index"), width="stretch")
+        home_stats = get_home_summary_stats(pair_results)
+        win_rate_text = "-" if pd.isna(home_stats["win_rate"]) else f"{home_stats['win_rate'] * 100:.2f}%"
+        st.subheader(
+            f"Consolidated Summary Table — Today Win Rate: {win_rate_text} | Wins: {home_stats['wins']} | Losses: {home_stats['losses']}"
+        )
+        if home_df.empty:
+            st.info("No current-day predictions available yet.")
+        else:
+            st.dataframe(style_status_table(home_df, percent_cols=["Confidence"]).hide(axis="index"), width="stretch")
 
     tab_map = {1: "EUR_USD", 2: "GBP_USD", 3: "XAU_USD", 4: "AUD_USD", 5: "USD_JPY"}
     for idx, instrument in tab_map.items():
