@@ -1,0 +1,10 @@
+audbest_model_artifact.joblib
+jpybest_model_artifact.joblib
+xaubest_model_artifact.joblib
+models/
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.DS_Store
+Thumbs.db
