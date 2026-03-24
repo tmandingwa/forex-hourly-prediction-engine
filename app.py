@@ -844,70 +844,129 @@ def build_ml_prediction_log(df_mid: pd.DataFrame, instrument: str, model, metada
 # ============================================================
 # CONSOLIDATION / FINAL TABLES
 # ============================================================
-def build_final_recommendation_table(prob_log_df: pd.DataFrame, ml_log_df: pd.DataFrame | None) -> pd.DataFrame:
-    df = prob_log_df[["time", "viewer_time_display", "probability_prediction", "actual", "probability_confidence", "probability_status"]].copy()
+def build_final_recommendation_table(
+    instrument: str,
+    prob_log_df: pd.DataFrame,
+    ml_log_df: pd.DataFrame | None
+) -> pd.DataFrame:
+    """
+    Pair-specific final recommendation logic:
+      - GBPUSD: use probability prediction only
+      - EURUSD / XAUUSD / AUDUSD / USDJPY:
+          only trade when probability and ML both exist and match
+          otherwise => Unsure
+    """
 
+    base_cols = [
+        "time",
+        "viewer_time_display",
+        "probability_prediction",
+        "actual",
+        "probability_confidence",
+        "probability_status",
+    ]
+
+    df = prob_log_df[base_cols].copy()
+
+    # --------------------------------------------------------
+    # If no ML log is available
+    # --------------------------------------------------------
     if ml_log_df is None or ml_log_df.empty:
         df["ml_prediction"] = np.nan
         df["ml_confidence"] = np.nan
         df["ml_status"] = np.nan
         df["ml_actual"] = np.nan
+
         df["actual_final"] = df["actual"].fillna("Pending")
-        df["final_prediction"] = df["probability_prediction"].fillna("Unsure")
-        df["final_confidence"] = df["probability_confidence"]
-        df["final_status"] = df["probability_status"].fillna("Pending")
+
+        if instrument == "GBPUSD":
+            df["final_prediction"] = np.where(
+                df["probability_prediction"].isin(["Bullish", "Bearish"]),
+                df["probability_prediction"],
+                "Unsure",
+            )
+            df["final_confidence"] = df["probability_confidence"]
+        else:
+            df["final_prediction"] = "Unsure"
+            df["final_confidence"] = np.nan
+
+        def final_status_no_ml(row):
+            pred = row["final_prediction"]
+            actual = row["actual_final"]
+            if actual == "Pending":
+                return "Pending"
+            if pred == "Unsure":
+                return "🚫 No Trade"
+            return "👑 Win" if pred == actual else "❌ Loss"
+
+        df["final_status"] = df.apply(final_status_no_ml, axis=1)
+
         return df[[
-            "time", "viewer_time_display", "final_prediction", "actual_final", "final_confidence", "final_status",
-            "probability_prediction", "probability_confidence", "ml_prediction", "ml_confidence"
+            "time",
+            "viewer_time_display",
+            "final_prediction",
+            "actual_final",
+            "final_confidence",
+            "final_status",
+            "probability_prediction",
+            "probability_confidence",
+            "ml_prediction",
+            "ml_confidence",
         ]].sort_values("time", ascending=False).reset_index(drop=True)
 
+    # --------------------------------------------------------
+    # Merge ML
+    # --------------------------------------------------------
     df = df.merge(
         ml_log_df[["time", "ml_prediction", "ml_confidence", "ml_status", "ml_actual"]],
         on="time",
         how="outer",
     )
+
     df["viewer_time_display"] = df["viewer_time_display"].fillna(
-        pd.to_datetime(df["time"], utc=True).dt.strftime("%Y-%m-%d %H:%M UTC")
+        pd.to_datetime(df["time"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M UTC")
     )
 
-    actual_col = np.where(df["actual"].notna(), df["actual"], df["ml_actual"])
-    df["actual_final"] = pd.Series(actual_col).fillna("Pending")
+    df["actual_final"] = df["actual"]
+    df["actual_final"] = df["actual_final"].where(df["actual_final"].notna(), df["ml_actual"])
+    df["actual_final"] = df["actual_final"].fillna("Pending")
 
-    same_signal = (
-        df["probability_prediction"].isin(["Bullish", "Bearish"]) &
-        df["ml_prediction"].isin(["Bullish", "Bearish"]) &
-        (df["probability_prediction"] == df["ml_prediction"])
-    )
+    prob_is_trade = df["probability_prediction"].isin(["Bullish", "Bearish"])
+    ml_is_trade = df["ml_prediction"].isin(["Bullish", "Bearish"])
+    same_signal = prob_is_trade & ml_is_trade & (df["probability_prediction"] == df["ml_prediction"])
 
-    prob_only_ok = (
-        df["probability_prediction"].isin(["Bullish", "Bearish"]) &
-        ~df["ml_prediction"].isin(["Bullish", "Bearish"])
-    )
-
-    ml_only_ok = (
-        df["ml_prediction"].isin(["Bullish", "Bearish"]) &
-        ~df["probability_prediction"].isin(["Bullish", "Bearish"])
-    )
-
-    df["final_prediction"] = np.select(
-        [same_signal, prob_only_ok, ml_only_ok],
-        [df["ml_prediction"], df["probability_prediction"], df["ml_prediction"]],
-        default="Unsure",
-    )
-
-    df["final_confidence"] = np.select(
-        [same_signal, prob_only_ok, ml_only_ok],
-        [
+    # --------------------------------------------------------
+    # Pair-specific final prediction logic
+    # --------------------------------------------------------
+    if instrument == "GBPUSD":
+        # GBP: use probability prediction only
+        df["final_prediction"] = np.where(
+            prob_is_trade,
+            df["probability_prediction"],
+            "Unsure",
+        )
+        df["final_confidence"] = np.where(
+            prob_is_trade,
+            df["probability_confidence"],
+            np.nan,
+        )
+    else:
+        # Others: only trade when probability and ML agree
+        df["final_prediction"] = np.where(
+            same_signal,
+            df["probability_prediction"],
+            "Unsure",
+        )
+        df["final_confidence"] = np.where(
+            same_signal,
             (df["probability_confidence"].fillna(0) + df["ml_confidence"].fillna(0)) / 2,
-            df["probability_confidence"].fillna(np.nan),
-            df["ml_confidence"].fillna(np.nan),
-        ],
-        default=np.nan,
-    )
+            np.nan,
+        )
 
     def final_status(row):
         pred = row["final_prediction"]
         actual = row["actual_final"]
+
         if actual == "Pending":
             return "Pending"
         if pred == "Unsure":
@@ -915,30 +974,56 @@ def build_final_recommendation_table(prob_log_df: pd.DataFrame, ml_log_df: pd.Da
         return "👑 Win" if pred == actual else "❌ Loss"
 
     df["final_status"] = df.apply(final_status, axis=1)
+
     return df[[
-        "time", "viewer_time_display", "final_prediction", "actual_final", "final_confidence", "final_status",
-        "probability_prediction", "probability_confidence", "ml_prediction", "ml_confidence"
+        "time",
+        "viewer_time_display",
+        "final_prediction",
+        "actual_final",
+        "final_confidence",
+        "final_status",
+        "probability_prediction",
+        "probability_confidence",
+        "ml_prediction",
+        "ml_confidence",
     ]].sort_values("time", ascending=False).reset_index(drop=True)
 
 
 def build_home_summary(pair_results: dict, viewer_tz_name: str) -> pd.DataFrame:
+    """
+    Home consolidated summary:
+      - today only
+      - latest first
+      - only rows we actually traded
+      - exclude Unsure / No Trade
+    """
     viewer_tz = ZoneInfo(viewer_tz_name)
     rows = []
+    current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
+
     for instrument in PAIR_ORDER:
         result = pair_results.get(instrument)
         final_df = None if result is None else result.get("final_table")
+
         if final_df is None or final_df.empty:
             continue
 
         df = final_df.copy()
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
         df = df.dropna(subset=["time"]).copy()
+
         if df.empty:
             continue
 
         df["ny_date"] = df["time"].dt.tz_convert(NY_TZ).dt.date
-        current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
         df = df[df["ny_date"] == current_ny_day].copy()
+
+        if df.empty:
+            continue
+
+        # only keep rows we chose to trade
+        df = df[df["final_prediction"].isin(["Bullish", "Bearish"])].copy()
+
         if df.empty:
             continue
 
@@ -954,27 +1039,52 @@ def build_home_summary(pair_results: dict, viewer_tz_name: str) -> pd.DataFrame:
             })
 
     if not rows:
-        return pd.DataFrame(columns=["Viewer Time", "Currency Pair", "Prediction", "Actual", "Status", "Confidence"])
+        return pd.DataFrame(columns=[
+            "Viewer Time",
+            "Currency Pair",
+            "Prediction",
+            "Actual",
+            "Status",
+            "Confidence",
+        ])
 
     out = pd.DataFrame(rows).sort_values("sort_time", ascending=False).reset_index(drop=True)
     return out[["Viewer Time", "Currency Pair", "Prediction", "Actual", "Status", "Confidence"]]
 
 
 def get_home_summary_stats(pair_results: dict) -> dict:
+    """
+    Stats for home title:
+      Today Win Rate: xx.xx% | Wins: x | Losses: y
+    Only include rows we actually traded.
+    """
     wins = 0
     losses = 0
+    current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
+
     for instrument in PAIR_ORDER:
         result = pair_results.get(instrument)
         final_df = None if result is None else result.get("final_table")
+
         if final_df is None or final_df.empty:
             continue
+
         df = final_df.copy()
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
         df = df.dropna(subset=["time"]).copy()
+
         if df.empty:
             continue
-        current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
+
         df = df[df["time"].dt.tz_convert(NY_TZ).dt.date == current_ny_day].copy()
+        if df.empty:
+            continue
+
+        # only rows we actually traded
+        df = df[df["final_prediction"].isin(["Bullish", "Bearish"])].copy()
+        if df.empty:
+            continue
+
         wins += int((df["final_status"] == "👑 Win").sum())
         losses += int((df["final_status"] == "❌ Loss").sum())
 
@@ -984,33 +1094,71 @@ def get_home_summary_stats(pair_results: dict) -> dict:
 
 
 def build_reports_table(pair_results: dict) -> pd.DataFrame:
+    """
+    Daily reports table:
+      - only rows we actually traded
+      - GBP trades come from probability-only final logic
+      - others trade only when prob + ML agree
+    """
     pair_daily = {}
     all_dates = set()
+
     for instrument in PAIR_ORDER:
         result = pair_results.get(instrument)
+
         if result is None or result.get("final_table") is None or result["final_table"].empty:
-            pair_daily[instrument] = pd.DataFrame(columns=["date", "wins", "losses", "trades", "win_rate"])
+            pair_daily[instrument] = pd.DataFrame(
+                columns=["date", "wins", "losses", "trades", "win_rate"]
+            )
             continue
+
         df = result["final_table"].copy()
-        df["time"] = pd.to_datetime(df["time"], utc=True)
-        df["date"] = df["time"].dt.tz_convert(NY_TZ).dt.date
-        df = df[df["final_prediction"].isin(["Bullish", "Bearish"])].copy()
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+        df = df.dropna(subset=["time"]).copy()
+
         if df.empty:
-            pair_daily[instrument] = pd.DataFrame(columns=["date", "wins", "losses", "trades", "win_rate"])
+            pair_daily[instrument] = pd.DataFrame(
+                columns=["date", "wins", "losses", "trades", "win_rate"]
+            )
             continue
+
+        df["date"] = df["time"].dt.tz_convert(NY_TZ).dt.date
+
+        # only rows we actually traded
+        df = df[df["final_prediction"].isin(["Bullish", "Bearish"])].copy()
+
+        if df.empty:
+            pair_daily[instrument] = pd.DataFrame(
+                columns=["date", "wins", "losses", "trades", "win_rate"]
+            )
+            continue
+
         df["win_flag"] = (df["final_status"] == "👑 Win").astype(int)
         df["loss_flag"] = (df["final_status"] == "❌ Loss").astype(int)
-        daily = df.groupby("date", as_index=False).agg(wins=("win_flag", "sum"), losses=("loss_flag", "sum"))
+
+        daily = df.groupby("date", as_index=False).agg(
+            wins=("win_flag", "sum"),
+            losses=("loss_flag", "sum"),
+        )
         daily["trades"] = daily["wins"] + daily["losses"]
-        daily["win_rate"] = np.where(daily["trades"] > 0, daily["wins"] / daily["trades"], np.nan)
+        daily["win_rate"] = np.where(
+            daily["trades"] > 0,
+            daily["wins"] / daily["trades"],
+            np.nan,
+        )
+
         pair_daily[instrument] = daily
         all_dates.update(daily["date"].tolist())
 
     if not all_dates:
         return pd.DataFrame(columns=[
-            "Date", "EUR Wins", "EUR Losses", "EUR Win Rate", "GBP Wins", "GBP Losses", "GBP Win Rate",
-            "XAU Wins", "XAU Losses", "XAU Win Rate", "AUD Wins", "AUD Losses", "AUD Win Rate",
-            "JPY Wins", "JPY Losses", "JPY Win Rate", "Overall Win Rate"
+            "Date",
+            "EUR Wins", "EUR Losses", "EUR Win Rate",
+            "GBP Wins", "GBP Losses", "GBP Win Rate",
+            "XAU Wins", "XAU Losses", "XAU Win Rate",
+            "AUD Wins", "AUD Losses", "AUD Win Rate",
+            "JPY Wins", "JPY Losses", "JPY Win Rate",
+            "Overall Win Rate",
         ])
 
     report = pd.DataFrame({"date": sorted(all_dates)})
@@ -1020,23 +1168,35 @@ def build_reports_table(pair_results: dict) -> pd.DataFrame:
     for instrument in PAIR_ORDER:
         label = PAIR_CONFIG[instrument]["label"]
         daily = pair_daily[instrument].copy()
-        report = report.merge(daily, on="date", how="left", suffixes=("", f"_{instrument}"))
-        wins_col = f"{label} Wins"
-        losses_col = f"{label} Losses"
-        win_rate_col = f"{label} Win Rate"
-        report[wins_col] = report["wins"].fillna(0) if "wins" in report.columns else 0
-        report[losses_col] = report["losses"].fillna(0) if "losses" in report.columns else 0
-        report[win_rate_col] = report["win_rate"] if "win_rate" in report.columns else np.nan
-        total_wins += report[wins_col].fillna(0).to_numpy(dtype=float)
-        total_losses += report[losses_col].fillna(0).to_numpy(dtype=float)
-        drop_cols = [c for c in ["wins", "losses", "trades", "win_rate"] if c in report.columns]
-        report.drop(columns=drop_cols, inplace=True)
 
-    report["Overall Win Rate"] = np.where((total_wins + total_losses) > 0, total_wins / (total_wins + total_losses), np.nan)
+        daily = daily.rename(columns={
+            "wins": f"{label} Wins",
+            "losses": f"{label} Losses",
+            "win_rate": f"{label} Win Rate",
+        })
+
+        report = report.merge(daily[[
+            "date",
+            f"{label} Wins",
+            f"{label} Losses",
+            f"{label} Win Rate",
+        ]], on="date", how="left")
+
+        report[f"{label} Wins"] = report[f"{label} Wins"].fillna(0)
+        report[f"{label} Losses"] = report[f"{label} Losses"].fillna(0)
+
+        total_wins += report[f"{label} Wins"].to_numpy(dtype=float)
+        total_losses += report[f"{label} Losses"].to_numpy(dtype=float)
+
+    report["Overall Win Rate"] = np.where(
+        (total_wins + total_losses) > 0,
+        total_wins / (total_wins + total_losses),
+        np.nan,
+    )
+
     report.rename(columns={"date": "Date"}, inplace=True)
     report = report.sort_values("Date", ascending=False).reset_index(drop=True)
     return report
-
 
 # ============================================================
 # DISPLAY HELPERS
