@@ -7,3 +7,11 @@ joblib
 streamlit-javascript
 streamlit-autorefresh
 matplotlib
+xgboost
+lightgbm
+scikit-learn
+joblib
+pandas
+numpy
+requests
+matplotlib

@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from html import escape
 from zoneinfo import ZoneInfo
-
+import traceback
 import numpy as np
 import pandas as pd
 import requests
@@ -980,8 +980,9 @@ try:
                 model, metadata = load_pair_artifact(instrument)
                 ml_log = build_ml_prediction_log(df_mid, instrument, model, metadata, viewer_tz_name)
                 final_table = build_final_recommendation_table(prob_log, ml_log)
-            except Exception as exc:
-                ml_error = str(exc)
+
+            except Exception as e:
+                st.error(f"ML load failed for {instrument}: {type(e).__name__}: {e}")
 
             pair_results[instrument] = {
                 "prob_log": prob_log,
