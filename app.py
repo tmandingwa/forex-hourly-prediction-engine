@@ -844,6 +844,7 @@ def build_ml_prediction_log(df_mid: pd.DataFrame, instrument: str, model, metada
 # ============================================================
 # CONSOLIDATION / FINAL TABLES
 # ============================================================
+
 def build_final_recommendation_table(
     instrument: str,
     prob_log_df: pd.DataFrame,
@@ -851,11 +852,13 @@ def build_final_recommendation_table(
 ) -> pd.DataFrame:
     """
     Pair-specific final recommendation logic:
-      - GBPUSD: use probability prediction only
-      - EURUSD / XAUUSD / AUDUSD / USDJPY:
+      - GBPUSD / XAUUSD / AUDUSD: use probability prediction only
+      - EURUSD / USDJPY:
           only trade when probability and ML both exist and match
           otherwise => Unsure
     """
+
+    probability_only_pairs = {"GBP_USD", "XAU_USD", "AUD_USD"}
 
     base_cols = [
         "time",
@@ -879,13 +882,17 @@ def build_final_recommendation_table(
 
         df["actual_final"] = df["actual"].fillna("Pending")
 
-        if instrument == "GBPUSD":
+        if instrument in probability_only_pairs:
             df["final_prediction"] = np.where(
                 df["probability_prediction"].isin(["Bullish", "Bearish"]),
                 df["probability_prediction"],
                 "Unsure",
             )
-            df["final_confidence"] = df["probability_confidence"]
+            df["final_confidence"] = np.where(
+                df["probability_prediction"].isin(["Bullish", "Bearish"]),
+                df["probability_confidence"],
+                np.nan,
+            )
         else:
             df["final_prediction"] = "Unsure"
             df["final_confidence"] = np.nan
@@ -938,8 +945,8 @@ def build_final_recommendation_table(
     # --------------------------------------------------------
     # Pair-specific final prediction logic
     # --------------------------------------------------------
-    if instrument == "GBPUSD":
-        # GBP: use probability prediction only
+    if instrument in probability_only_pairs:
+        # GBP / XAU / AUD: use probability prediction only
         df["final_prediction"] = np.where(
             prob_is_trade,
             df["probability_prediction"],
@@ -951,7 +958,7 @@ def build_final_recommendation_table(
             np.nan,
         )
     else:
-        # Others: only trade when probability and ML agree
+        # EUR / JPY: only trade when probability and ML agree
         df["final_prediction"] = np.where(
             same_signal,
             df["probability_prediction"],
