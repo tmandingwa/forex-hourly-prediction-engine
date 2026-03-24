@@ -78,15 +78,22 @@ MAX_CANDLES_PER_REQUEST = 1000
 MIN_COUNT_REQUIRED = 5
 DEFAULT_DAYS_BACK = 270
 DEFAULT_NUM_LAGS = 6
+PAIR_DEFAULT_LAGS = {
+    "EUR_USD": 6,
+    "GBP_USD": 10,
+    "XAU_USD": 6,
+    "AUD_USD": 6,
+    "USD_JPY": 10,
+}
 MAX_NUM_LAGS = 15
 MAX_HISTORY_DAYS = 2500
 APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = APP_DIR / "models"
 
 GOOGLE_DRIVE_FILE_IDS = {
-    "AUD_USD": "1D19KhexIsQ_bNyvPr0hAzTPmuG1Ld5vl",
+    "AUD_USD": "178xJSdurCZQh3WR4S-VIJHJenvY9JOPJ",
     "USD_JPY": "1pzJctNp9W64OVXq7116DmrEkPslwt2M-",
-    "XAU_USD": "178xJSdurCZQh3WR4S-VIJHJenvY9JOPJ",
+    "XAU_USD": "1D19KhexIsQ_bNyvPr0hAzTPmuG1Ld5vl",
 }
 
 
@@ -295,19 +302,20 @@ def download_large_file_from_google_drive(file_id: str, destination: Path) -> Pa
 
 
 def resolve_artifact_path(instrument: str, artifact_name: str) -> Path:
-    local_path = APP_DIR / artifact_name
-    if local_path.exists():
-        return local_path
-
-    downloaded_path = MODEL_DIR / artifact_name
-    if downloaded_path.exists():
-        return downloaded_path
+    search_paths = [
+        APP_DIR / artifact_name,
+        MODEL_DIR / artifact_name,
+        Path.cwd() / artifact_name,
+    ]
+    for p in search_paths:
+        if p.exists():
+            return p
 
     file_id = GOOGLE_DRIVE_FILE_IDS.get(instrument)
     if not file_id:
         raise FileNotFoundError(f"Missing artifact file: {artifact_name}")
 
-    return download_large_file_from_google_drive(file_id, downloaded_path)
+    return download_large_file_from_google_drive(file_id, MODEL_DIR / artifact_name)
 
 
 # ============================================================
@@ -517,7 +525,7 @@ def build_probability_log(df_with_future: pd.DataFrame, key_summary: pd.DataFram
     current_ny_day = pd.Timestamp.now(tz=NY_TZ).date()
     out = out[out["time"].dt.tz_convert(NY_TZ).dt.date == current_ny_day].copy()
     out.rename(columns={"confidence": "probability_confidence", "status": "probability_status"}, inplace=True)
-    return out[["time", "viewer_time_display", "probability_prediction", "actual", "probability_confidence", "probability_status", "total_count"]].sort_values("time").reset_index(drop=True)
+    return out[["time", "viewer_time_display", "probability_prediction", "actual", "probability_confidence", "probability_status", "total_count"]].sort_values("time", ascending=False).reset_index(drop=True)
 
 
 # ============================================================
@@ -527,14 +535,16 @@ def build_probability_log(df_with_future: pd.DataFrame, key_summary: pd.DataFram
 def load_pair_artifact(instrument: str):
     cfg = PAIR_CONFIG[instrument]
     artifact_path = resolve_artifact_path(instrument, cfg["artifact"])
-    metadata_path = APP_DIR / cfg["metadata"]
+    metadata_candidates = [APP_DIR / cfg["metadata"], Path.cwd() / cfg["metadata"], MODEL_DIR / cfg["metadata"]]
 
     model = joblib.load(artifact_path)
 
     metadata = {}
-    if metadata_path.exists():
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
+    for metadata_path in metadata_candidates:
+        if metadata_path.exists():
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            break
 
     if not isinstance(metadata, dict):
         metadata = {}
@@ -586,11 +596,37 @@ def _coerce_1d_array(x, length_hint=None):
     return arr.reshape(-1)
 
 
+def _predict_fallback(est, X: pd.DataFrame, want_proba: bool):
+    """Predict robustly for artifacts saved from slightly different sklearn/xgboost environments.
+    Some old serialized pipelines break on DataFrame column handling and raise KeyError like 60.
+    In that case, retry with numpy values positionally.
+    """
+    X_df = X
+    X_np = X_df.to_numpy(dtype=float, copy=False)
+
+    if want_proba:
+        try:
+            return est.predict_proba(X_df)
+        except Exception as e1:
+            try:
+                return est.predict_proba(X_np)
+            except Exception as e2:
+                raise RuntimeError(f"predict_proba failed on DataFrame [{type(e1).__name__}: {e1}] and numpy [{type(e2).__name__}: {e2}]")
+    else:
+        try:
+            return est.predict(X_df)
+        except Exception as e1:
+            try:
+                return est.predict(X_np)
+            except Exception as e2:
+                raise RuntimeError(f"predict failed on DataFrame [{type(e1).__name__}: {e1}] and numpy [{type(e2).__name__}: {e2}]")
+
+
 def predict_with_loaded_artifact(model, X: pd.DataFrame):
     if hasattr(model, "predict"):
-        pred_num = _coerce_1d_array(model.predict(X), len(X))
+        pred_num = _coerce_1d_array(_predict_fallback(model, X, want_proba=False), len(X))
         if hasattr(model, "predict_proba"):
-            pred_prob = np.asarray(model.predict_proba(X))
+            pred_prob = np.asarray(_predict_fallback(model, X, want_proba=True))
             if pred_prob.ndim == 2 and pred_prob.shape[1] >= 2:
                 pred_prob = pred_prob[:, 1]
             else:
@@ -614,13 +650,13 @@ def predict_with_loaded_artifact(model, X: pd.DataFrame):
                 if est is None:
                     continue
                 if hasattr(est, "predict_proba"):
-                    proba = np.asarray(est.predict_proba(X))
+                    proba = np.asarray(_predict_fallback(est, X, want_proba=True))
                     if proba.ndim == 2 and proba.shape[1] >= 2:
                         pos = proba[:, 1]
                     else:
                         pos = proba.reshape(-1)
                 else:
-                    pred = _coerce_1d_array(est.predict(X), len(X)).astype(float)
+                    pred = _coerce_1d_array(_predict_fallback(est, X, want_proba=False), len(X)).astype(float)
                     pos = pred
                 pos = _coerce_1d_array(pos, len(X)).astype(float)
                 stack_parts.append(pos.reshape(-1, 1))
@@ -820,7 +856,7 @@ def build_ml_prediction_log(df_mid: pd.DataFrame, instrument: str, model, metada
     out = out[["prediction_time", "viewer_time_display", "ml_prediction", "actual", "ml_confidence", "ml_status"]].copy()
     out.rename(columns={"prediction_time": "time", "viewer_time_display": "viewer_time", "actual": "ml_actual"}, inplace=True)
     out["ml_actual"] = out["ml_actual"].fillna("Pending")
-    return out.sort_values("time").reset_index(drop=True)
+    return out.sort_values("time", ascending=False).reset_index(drop=True)
 
 
 # ============================================================
@@ -841,7 +877,7 @@ def build_final_recommendation_table(prob_log_df: pd.DataFrame, ml_log_df: pd.Da
         return df[[
             "time", "viewer_time_display", "final_prediction", "actual_final", "final_confidence", "final_status",
             "probability_prediction", "probability_confidence", "ml_prediction", "ml_confidence"
-        ]].sort_values("time").reset_index(drop=True)
+        ]].sort_values("time", ascending=False).reset_index(drop=True)
 
     df = df.merge(
         ml_log_df[["time", "ml_prediction", "ml_confidence", "ml_status", "ml_actual"]],
@@ -900,7 +936,7 @@ def build_final_recommendation_table(prob_log_df: pd.DataFrame, ml_log_df: pd.Da
     return df[[
         "time", "viewer_time_display", "final_prediction", "actual_final", "final_confidence", "final_status",
         "probability_prediction", "probability_confidence", "ml_prediction", "ml_confidence"
-    ]].sort_values("time").reset_index(drop=True)
+    ]].sort_values("time", ascending=False).reset_index(drop=True)
 
 
 def build_home_summary(pair_results: dict, viewer_tz_name: str) -> pd.DataFrame:
@@ -918,7 +954,7 @@ def build_home_summary(pair_results: dict, viewer_tz_name: str) -> pd.DataFrame:
                 "Confidence": np.nan,
             })
             continue
-        latest = result["final_table"].sort_values("time").iloc[-1]
+        latest = result["final_table"].sort_values("time", ascending=False).iloc[0]
         view_time = pd.to_datetime(latest["time"], utc=True).tz_convert(viewer_tz).strftime("%Y-%m-%d %H:%M %Z")
         rows.append({
             "Viewer Time": view_time,
@@ -1040,6 +1076,7 @@ def render_pair_tab(instrument: str, result: dict):
     final_df = result.get("final_table")
     prob_df = result.get("prob_log")
     ml_df = result.get("ml_log")
+    st.caption(f"Current lag setting for {title}: {result.get('num_lags', PAIR_DEFAULT_LAGS.get(instrument, DEFAULT_NUM_LAGS))}")
 
     st.subheader(f"{title} Final Recommendation Table")
     if final_df is None or final_df.empty:
@@ -1103,11 +1140,22 @@ time_info = viewer_time_strings(viewer_tz_name)
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("Probability engine defaults: lags = 6, history days = 270")
+    st.caption("Probability engine defaults by pair: EUR=6, GBP=10, XAU=6, AUD=6, JPY=10; history days = 270")
     days_back = st.slider("History days", min_value=30, max_value=MAX_HISTORY_DAYS, value=DEFAULT_DAYS_BACK, step=10)
-    num_lags = st.slider("Number of lags", min_value=2, max_value=MAX_NUM_LAGS, value=DEFAULT_NUM_LAGS, step=1)
     include_day_of_week = st.checkbox("Add day of week as part of key", value=False)
     min_count_required = st.number_input("Minimum count required", min_value=1, max_value=100, value=MIN_COUNT_REQUIRED, step=1)
+    st.markdown("**Per-pair lag settings**")
+    pair_lag_settings = {}
+    for instrument in PAIR_ORDER:
+        label = PAIR_CONFIG[instrument]["display"]
+        pair_lag_settings[instrument] = st.slider(
+            f"{label} lags",
+            min_value=2,
+            max_value=MAX_NUM_LAGS,
+            value=PAIR_DEFAULT_LAGS.get(instrument, DEFAULT_NUM_LAGS),
+            step=1,
+            key=f"lags_{instrument}",
+        )
     st.caption(f"Viewer timezone detected: {viewer_tz_name}")
     st.caption("AUD, XAU, and JPY model artifacts auto-download from Google Drive if not found locally.")
 
@@ -1128,11 +1176,12 @@ try:
                 pair_results[instrument] = {"error": "No data returned from OANDA."}
                 continue
 
+            pair_num_lags = int(pair_lag_settings.get(instrument, PAIR_DEFAULT_LAGS.get(instrument, DEFAULT_NUM_LAGS)))
             df_tz = prepare_df_tz(df_mid)
-            df_pattern = build_pattern_dataset(df_tz, num_lags=num_lags, include_day_of_week=include_day_of_week)
+            df_pattern = build_pattern_dataset(df_tz, num_lags=pair_num_lags, include_day_of_week=include_day_of_week)
             key_summary = summarise_keys(df_pattern, min_count_required=min_count_required)
             next_pred = predict_next_hour(df_pattern, key_summary)
-            prob_log = build_probability_log(df_pattern, key_summary, next_pred, viewer_tz_name, num_lags)
+            prob_log = build_probability_log(df_pattern, key_summary, next_pred, viewer_tz_name, pair_num_lags)
 
             ml_log = None
             ml_error = None
@@ -1150,6 +1199,7 @@ try:
                 "ml_log": ml_log,
                 "final_table": final_table,
                 "ml_error": ml_error,
+                "num_lags": pair_num_lags,
             }
 
     tabs = st.tabs(["Home", "EUR", "GBP", "XAU", "AUD", "JPY", "Reports"])
@@ -1192,5 +1242,5 @@ except Exception as exc:
 
 st.markdown("---")
 st.markdown(
-    "Deploy this file as `app.py`. Keep all metadata JSON files in the repo. EUR and GBP artifacts can stay in the repo, while AUD, XAU, and JPY artifacts can be downloaded automatically from Google Drive on first run. Add `OANDA_API_KEY` in Streamlit secrets and set the Google Drive files to `Anyone with the link -> Viewer`."
+    "Deploy this file as `app.py`. Keep all metadata JSON files in the repo. EUR and GBP artifacts can stay in the repo, while AUD, XAU, and JPY artifacts can be downloaded automatically from Google Drive on first run. Add `OANDA_API_KEY` in Streamlit secrets and set the Google Drive files to `Anyone with the link -> Viewer`. Tables are sorted latest first, and default probability lags are EUR=6, GBP=10, XAU=6, AUD=6, JPY=10."
 )
