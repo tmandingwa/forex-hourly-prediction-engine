@@ -6,3 +6,4 @@ scikit-learn
 joblib
 streamlit-javascript
 streamlit-autorefresh
+matplotlib
